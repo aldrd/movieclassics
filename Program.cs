@@ -107,7 +107,13 @@ var cache = File.Exists(cachePath)
     : new Dictionary<string, TmdbEntry>();
 
 var missing = selected.Values.SelectMany(l => l)
-    .Where(r => !cache.ContainsKey(r.ImdbId)).ToList();
+    .Where(r =>
+    {
+        // An entry with no data and no NotFound marker is an empty shell —
+        // treat it as missing so the run refetches instead of publishing blanks.
+        return !cache.TryGetValue(r.ImdbId, out var entry)
+            || (entry.TmdbId == null && !entry.NotFound);
+    }).ToList();
 Console.WriteLine($"TMDB: {missing.Count:N0} новых титлов, {cache.Count:N0} в кэше");
 
 var done = 0;
