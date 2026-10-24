@@ -23,13 +23,12 @@ const string TmdbKey = "ae8be8be239638a89b02d125bf8d5458";
 const int MovieFirstYear = 1937;
 const int MovieYearQuota = 50;
 const int SeriesFirstYear = 1980;
-const int SeriesYearQuota = 40;
-// Enrichment happens after the vote-based cut, so extra candidates per year
-// are fetched: titles whose TMDB data has no RU description are dropped and
-// replaced by the next-best voted ones. Series need a deeper bench — RU
-// coverage on TMDB is thin for older, less-voted shows.
-const int MovieMargin = 30;
-const int SeriesMargin = 60;
+const int SeriesYearQuota = 50;
+// Yearly composition: 80% of the quota is the most voted titles with a RU
+// description, the rest are the highest-rated of the year's top-200 by votes
+// that missed the votes part. Candidates are overfetched to the whole
+// top-200 so the rating picks (and description backfill) are covered.
+const int PoolPerYear = 200;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -53,8 +52,8 @@ var yearFraction = Math.Clamp(
 int YearQuota(int quota, int year) =>
     year == currentYear ? Math.Max(1, (int)Math.Round(quota * yearFraction)) : quota;
 
-Console.WriteLine($"MovieClassics: фильмы {MovieFirstYear}+ (по {MovieYearQuota}/год), " +
-                  $"сериалы {SeriesFirstYear}+ (по {SeriesYearQuota}/год); {currentYear}: " +
+Console.WriteLine($"MovieClassics: фильмы {MovieFirstYear}+, сериалы {SeriesFirstYear}+ " +
+                  $"(по {MovieYearQuota}/год: 40 по голосам + 10 по рейтингу из топ-{PoolPerYear}); {currentYear}: " +
                   $"{YearQuota(MovieYearQuota, currentYear)} фильмов / {YearQuota(SeriesYearQuota, currentYear)} сериалов " +
                   $"({yearFraction:P0} года прошло){(smoke ? " [SMOKE]" : "")}");
 
@@ -89,95 +88,144 @@ foreach (var row in ReadBasics(basicsPath, votes, movieFirst, seriesFirst, curre
 
 var kindConfigs = new[]
 {
-    (Kind: "movie", Quota: MovieYearQuota, FirstYear: movieFirst, Margin: MovieMargin),
-    (Kind: "series", Quota: SeriesYearQuota, FirstYear: seriesFirst, Margin: SeriesMargin)
+    (Kind: "movie", Quota: MovieYearQuota, FirstYear: movieFirst),
+    (Kind: "series", Quota: SeriesYearQuota, FirstYear: seriesFirst)
 };
 
-// Pass 1: overselect by votes; the description cut happens after TMDB enrichment.
+// Pass 1: the whole top-200 of each year by votes; the votes/rating split
+// and the description cut happen after TMDB enrichment.
 var candidates = new Dictionary<string, List<TitleRow>>();
-foreach (var (kind, quota, firstYear, margin) in kindConfigs)
+foreach (var (kind, quota, firstYear) in kindConfigs)
 {
     var picked = new List<TitleRow>();
     foreach (var year in Enumerable.Range(firstYear, currentYear - firstYear + 1).OrderBy(y => y))
     {
         if (!byYear.TryGetValue(kind, out var rows) || !rows.TryGetValue(year, out var list)) continue;
         list.Sort((a, b) => b.Votes.CompareTo(a.Votes));
-        picked.AddRange(list.Take(YearQuota(quota, year) + margin));
+        picked.AddRange(list.Take(PoolPerYear));
     }
     candidates[kind] = picked;
-    Console.WriteLine($"  {kind}: {picked.Count:N0} кандидатов");
+    Console.WriteLine($"  {kind}: {picked.Count:N0} кандидатов (топ-{PoolPerYear} года)");
 }
 
 // ---- TMDB enrichment (cached) ----------------------------------------------
 
 var cachePath = Path.Combine(cacheDir, "tmdb-cache.json");
+// Web defaults: the file is written camelCase, and matching must be
+// case-INsensitive — the case-sensitive default deserializer silently
+// produced all-null shells out of perfectly good entries (the "shell
+// incident": every run refetched everything it needed).
+var cacheJsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 var cache = File.Exists(cachePath)
-    ? JsonSerializer.Deserialize<Dictionary<string, TmdbEntry>>(File.ReadAllText(cachePath)) ?? new()
+    ? JsonSerializer.Deserialize<Dictionary<string, TmdbEntry>>(File.ReadAllText(cachePath), cacheJsonOpts) ?? new()
     : new Dictionary<string, TmdbEntry>();
+Console.WriteLine($"  кэш: {cache.Count:N0} записей, " +
+                  $"{cache.Values.Count(e => e.TmdbId == null && !e.NotFound):N0} пустых, " +
+                  $"{cache.Values.Count(e => e.ReleaseDate != null):N0} с датой");
 
-var missing = candidates.Values.SelectMany(l => l)
-    .Where(r =>
+var work = new List<(TitleRow Row, bool DateOnly, TmdbEntry? Entry)>();
+foreach (var row in candidates.Values.SelectMany(l => l))
+{
+    if (!cache.TryGetValue(row.ImdbId, out var entry) || (entry.TmdbId == null && !entry.NotFound))
     {
-        // An entry with no data and no NotFound marker is an empty shell —
-        // treat it as missing so the run refetches instead of publishing blanks.
-        return !cache.TryGetValue(r.ImdbId, out var entry)
-            || (entry.TmdbId == null && !entry.NotFound);
-    }).ToList();
-Console.WriteLine($"TMDB: {missing.Count:N0} новых титлов, {cache.Count:N0} в кэше");
+        // No entry, or an empty shell (no data and no NotFound marker) —
+        // treat as missing so the run refetches instead of publishing blanks.
+        work.Add((row, false, null));
+    }
+    else if (entry.TmdbId != null && !entry.NotFound && entry.ReleaseDate == null && !entry.NoReleaseDate)
+    {
+        // Enriched before release dates were kept — one light details call.
+        work.Add((row, true, entry));
+    }
+}
+Console.WriteLine($"TMDB: {work.Count(w => !w.DateOnly):N0} новых титлов, " +
+                  $"{work.Count(w => w.DateOnly):N0} дат, {cache.Count:N0} в кэше");
 
 var done = 0;
 var gate = new SemaphoreSlim(4);
 var saveLock = new object();
-var tasks = missing.Select(async row =>
+var tasks = work.Select(async w =>
 {
     await gate.WaitAsync();
     try
     {
-        var entry = await FetchTmdbAsync(http, row);
-        lock (saveLock) { cache[row.ImdbId] = entry; }
-        var n = Interlocked.Increment(ref done);
-        if (n % 100 == 0)
+        if (w.DateOnly)
         {
-            Console.Write($"\r  TMDB {n}/{missing.Count}");
+            await FetchReleaseDateAsync(http, w.Row, w.Entry!);
+        }
+        else
+        {
+            var entry = await FetchTmdbAsync(http, w.Row);
+            lock (saveLock) { cache[w.Row.ImdbId] = entry; }
+        }
+        var n = Interlocked.Increment(ref done);
+        if (n % 500 == 0)
+        {
+            Console.Write($"\r  TMDB {n}/{work.Count}");
             lock (saveLock) { SaveCache(cachePath, cache); }
         }
     }
     catch (Exception ex)
     {
         // Network hiccups: leave the title uncached so the next run retries it.
-        Console.WriteLine($"\n  ! {row.ImdbId} {row.Title}: {ex.Message}");
+        Console.WriteLine($"\n  ! {w.Row.ImdbId} {w.Row.Title}: {ex.Message}");
     }
     finally { gate.Release(); }
 }).ToList();
 await Task.WhenAll(tasks);
-Console.WriteLine($"\r  TMDB {done}/{missing.Count} готово   ");
+Console.WriteLine($"\r  TMDB {done}/{work.Count} готово   ");
+Console.WriteLine($"  перед сохранением кэша: {cache.Count:N0} записей");
 SaveCache(cachePath, cache);
 
-// Pass 2: keep only titles with a RU description (the one the app displays),
-// backfilling each year from the remaining overselected candidates.
+// Pass 2: 80% of the yearly quota = most voted titles with a RU description;
+// the rest = highest-rated of the year's top-200 by votes that missed the
+// votes part. Within a year everything is ordered by release date (undated
+// last), votes descending as the tie-break.
 var selected = new Dictionary<string, List<TitleRow>>();
-foreach (var (kind, quota, firstYear, _) in kindConfigs)
+foreach (var (kind, quota, firstYear) in kindConfigs)
 {
     var final = new List<TitleRow>();
-    var dropped = 0;
+    var droppedNoDescription = 0;
+    var totalVotesPart = 0;
+    var totalRatingPart = 0;
+
     foreach (var year in Enumerable.Range(firstYear, currentYear - firstYear + 1).OrderBy(y => y))
     {
-        var taken = 0;
         var quotaY = YearQuota(quota, year);
-        foreach (var row in candidates[kind])
+        var votesQuota = (int)Math.Round(quotaY * 0.8);
+        var ratingQuota = quotaY - votesQuota;
+
+        var pool = candidates[kind].Where(r => r.Year == year).ToList(); // votes desc already
+        bool HasRuDescription(TitleRow r) =>
+            cache.TryGetValue(r.ImdbId, out var e) && !string.IsNullOrWhiteSpace(e.OverviewRu);
+        string ReleaseDateOf(TitleRow r) =>
+            cache.TryGetValue(r.ImdbId, out var e) ? e.ReleaseDate ?? "9999-99-99" : "9999-99-99";
+
+        var votesPart = new List<TitleRow>();
+        foreach (var row in pool)
         {
-            if (row.Year != year) continue;
-            if (taken == quotaY) break;
-            if (cache.TryGetValue(row.ImdbId, out var tmdb) && !string.IsNullOrWhiteSpace(tmdb.OverviewRu))
-            {
-                final.Add(row);
-                taken++;
-            }
-            else dropped++;
+            if (votesPart.Count == votesQuota) break;
+            if (HasRuDescription(row)) votesPart.Add(row);
+            else droppedNoDescription++;
         }
+
+        var ratingPart = pool.Except(votesPart)
+            .OrderByDescending(r => r.Rating)
+            .ThenByDescending(r => r.Votes)
+            .Where(HasRuDescription)
+            .Take(ratingQuota)
+            .ToList();
+
+        totalVotesPart += votesPart.Count;
+        totalRatingPart += ratingPart.Count;
+        final.AddRange(votesPart.Concat(ratingPart)
+            .OrderBy(ReleaseDateOf)
+            .ThenByDescending(r => r.Votes));
     }
+
     selected[kind] = final;
-    Console.WriteLine($"  {kind}: {final.Count:N0} отобрано, {dropped} без описания исключено");
+    Console.WriteLine($"  {kind}: {final.Count:N0} отобрано ({totalVotesPart} по голосам + {totalRatingPart} по рейтингу), " +
+                      $"{droppedNoDescription} без описания исключено");
 }
 
 // ---- output ----------------------------------------------------------------
@@ -193,7 +241,7 @@ var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "series.json") })
 {
     var items = new List<Dictionary<string, object?>>();
-    foreach (var row in selected[kind]) // already year asc, votes desc
+    foreach (var row in selected[kind]) // year asc, release date asc inside a year
     {
         cache.TryGetValue(row.ImdbId, out var tmdb);
         items.Add(new Dictionary<string, object?>
@@ -202,6 +250,7 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
             ["tmdbId"] = tmdb?.TmdbId,
             ["kind"] = kind == "movie" ? "фильм" : "сериал",
             ["year"] = row.Year,
+            ["releaseDate"] = tmdb?.ReleaseDate,
             ["rating"] = row.Rating,
             ["votes"] = row.Votes,
             ["titleOriginal"] = row.OriginalTitle,
@@ -217,8 +266,8 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
     File.WriteAllText(path, JsonSerializer.Serialize(items, jsonOpts));
     Console.WriteLine($"  {fileName}: {items.Count:N0} записей");
 
-    // Slim variant for the mobile app: only the fields it displays.
-    var slim = items.Select(m => new Dictionary<string, object?>
+    // App display shape: only the fields it shows.
+    static Dictionary<string, object?> ToAppShape(Dictionary<string, object?> m) => new()
     {
         ["imdbId"] = m["imdbId"],
         ["year"] = m["year"],
@@ -229,10 +278,18 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
         ["titleRu"] = m["titleRu"],
         ["overviewRu"] = m["overviewRu"],
         ["posterSmall"] = m["posterSmall"]
-    });
+    };
+
     var slimPath = Path.Combine(docsDir, "data", kind == "movie" ? "movies-slim.json" : "series-slim.json");
-    File.WriteAllText(slimPath, JsonSerializer.Serialize(slim, jsonOpts));
+    File.WriteAllText(slimPath, JsonSerializer.Serialize(items.Select(ToAppShape), jsonOpts));
     Console.WriteLine($"  {Path.GetFileName(slimPath)}: {items.Count:N0} записей");
+
+    // Tail with just the newest 50: the app shows it instantly while the
+    // full file downloads in the background.
+    var latestPath = Path.Combine(docsDir, "data", kind == "movie" ? "movies-latest.json" : "series-latest.json");
+    var latest = items.Skip(Math.Max(0, items.Count - 50)).Select(ToAppShape);
+    File.WriteAllText(latestPath, JsonSerializer.Serialize(latest, jsonOpts));
+    Console.WriteLine($"  {Path.GetFileName(latestPath)}: {items.Skip(Math.Max(0, items.Count - 50)).Count():N0} записей");
 }
 
 var meta = new
@@ -273,6 +330,14 @@ static void SaveCache(string path, Dictionary<string, TmdbEntry> cache)
     var opts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
     File.WriteAllText(tmp, JsonSerializer.Serialize(cache, opts));
     File.Move(tmp, path, overwrite: true);
+
+    // Cache entries have gone missing between runs before (the shell
+    // incident), so verify the write actually holds everything.
+    var reloaded = JsonSerializer.Deserialize<Dictionary<string, TmdbEntry>>(File.ReadAllText(path), opts);
+    if (reloaded == null || reloaded.Count != cache.Count)
+    {
+        Console.WriteLine($"  !! SAVECACHE MISMATCH: wrote {cache.Count:N0}, file holds {reloaded?.Count ?? 0:N0}");
+    }
 }
 
 static IEnumerable<(string Tconst, double Rating, int Count)> ReadRatings(string path)
@@ -342,8 +407,26 @@ async Task<TmdbEntry> FetchTmdbAsync(HttpClient client, TitleRow row)
         entry.OverviewRu = string.IsNullOrWhiteSpace(ru.Overview) ? null : ru.Overview;
     }
 
+    entry.ReleaseDate = FirstNonEmpty(
+        row.Kind == "movie" ? ru?.ReleaseDate : ru?.FirstAirDate,
+        row.Kind == "movie" ? hit.ReleaseDate : hit.FirstAirDate);
+    entry.NoReleaseDate = entry.ReleaseDate == null;
+
     return entry;
 }
+
+// One light details call for entries enriched before release dates were kept.
+static async Task FetchReleaseDateAsync(HttpClient client, TitleRow row, TmdbEntry entry)
+{
+    var kindPath = row.Kind == "movie" ? "movie" : "tv";
+    var ru = await client.GetFromJsonAsync<DetailsResponse>(
+        $"https://api.themoviedb.org/3/{kindPath}/{entry.TmdbId}?api_key={TmdbKey}&language=ru-RU");
+    entry.ReleaseDate = row.Kind == "movie" ? ru?.ReleaseDate : ru?.FirstAirDate;
+    entry.NoReleaseDate = string.IsNullOrWhiteSpace(entry.ReleaseDate);
+}
+
+static string? FirstNonEmpty(string? first, string? second) =>
+    !string.IsNullOrWhiteSpace(first) ? first : (string.IsNullOrWhiteSpace(second) ? null : second);
 
 internal sealed record TitleRow(string ImdbId, string Kind, int Year, string Title, string OriginalTitle, double Rating, int Votes);
 
@@ -355,6 +438,10 @@ internal sealed class TmdbEntry
     public string? TitleRu { get; set; }
     public string? OverviewEn { get; set; }
     public string? OverviewRu { get; set; }
+    // "YYYY-MM-DD"; NoReleaseDate marks titles whose TMDB entry has none,
+    // so the date pass doesn't retry them every run.
+    public string? ReleaseDate { get; set; }
+    public bool NoReleaseDate { get; set; }
     public bool NotFound { get; set; }
 }
 
@@ -370,6 +457,8 @@ internal sealed class DetailsResponse
     public string? Title { get; set; }
     public string? Name { get; set; }
     public string? Overview { get; set; }
+    [JsonPropertyName("release_date")] public string? ReleaseDate { get; set; }
+    [JsonPropertyName("first_air_date")] public string? FirstAirDate { get; set; }
     [JsonPropertyName("poster_path")] public string? PosterPath { get; set; }
 }
 
