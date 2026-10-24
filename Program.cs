@@ -271,6 +271,7 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
     {
         ["imdbId"] = m["imdbId"],
         ["year"] = m["year"],
+        ["releaseDate"] = m["releaseDate"],
         ["rating"] = m["rating"],
         ["votes"] = m["votes"],
         ["titleOriginal"] = m["titleOriginal"],
