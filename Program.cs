@@ -143,7 +143,9 @@ SaveCache(cachePath, cache);
 var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 {
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    WriteIndented = false
+    WriteIndented = false,
+    // Keep Cyrillic as UTF-8: \uXXXX escaping roughly doubles the payload.
+    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
 };
 
 foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "series.json") })
@@ -172,6 +174,23 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
     var path = Path.Combine(docsDir, "data", fileName);
     File.WriteAllText(path, JsonSerializer.Serialize(items, jsonOpts));
     Console.WriteLine($"  {fileName}: {items.Count:N0} записей");
+
+    // Slim variant for the mobile app: only the fields it displays.
+    var slim = items.Select(m => new Dictionary<string, object?>
+    {
+        ["imdbId"] = m["imdbId"],
+        ["year"] = m["year"],
+        ["rating"] = m["rating"],
+        ["votes"] = m["votes"],
+        ["titleOriginal"] = m["titleOriginal"],
+        ["titleEn"] = m["titleEn"],
+        ["titleRu"] = m["titleRu"],
+        ["overviewRu"] = m["overviewRu"],
+        ["posterSmall"] = m["posterSmall"]
+    });
+    var slimPath = Path.Combine(docsDir, "data", kind == "movie" ? "movies-slim.json" : "series-slim.json");
+    File.WriteAllText(slimPath, JsonSerializer.Serialize(slim, jsonOpts));
+    Console.WriteLine($"  {Path.GetFileName(slimPath)}: {items.Count:N0} записей");
 }
 
 var meta = new
