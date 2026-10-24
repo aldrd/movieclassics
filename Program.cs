@@ -23,7 +23,13 @@ const string TmdbKey = "ae8be8be239638a89b02d125bf8d5458";
 const int MovieFirstYear = 1937;
 const int MovieYearQuota = 50;
 const int SeriesFirstYear = 1980;
-const int SeriesYearQuota = 20;
+const int SeriesYearQuota = 40;
+// Enrichment happens after the vote-based cut, so extra candidates per year
+// are fetched: titles whose TMDB data has no RU description are dropped and
+// replaced by the next-best voted ones. Series need a deeper bench — RU
+// coverage on TMDB is thin for older, less-voted shows.
+const int MovieMargin = 30;
+const int SeriesMargin = 60;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -81,22 +87,25 @@ foreach (var row in ReadBasics(basicsPath, votes, movieFirst, seriesFirst, curre
     years.GetOrAdd(row.Year, () => new List<TitleRow>()).Add(row);
 }
 
-var selected = new Dictionary<string, List<TitleRow>>();
-foreach (var (kind, quota, firstYear) in new[]
-         {
-             ("movie", MovieYearQuota, movieFirst),
-             ("series", SeriesYearQuota, seriesFirst)
-         })
+var kindConfigs = new[]
+{
+    (Kind: "movie", Quota: MovieYearQuota, FirstYear: movieFirst, Margin: MovieMargin),
+    (Kind: "series", Quota: SeriesYearQuota, FirstYear: seriesFirst, Margin: SeriesMargin)
+};
+
+// Pass 1: overselect by votes; the description cut happens after TMDB enrichment.
+var candidates = new Dictionary<string, List<TitleRow>>();
+foreach (var (kind, quota, firstYear, margin) in kindConfigs)
 {
     var picked = new List<TitleRow>();
     foreach (var year in Enumerable.Range(firstYear, currentYear - firstYear + 1).OrderBy(y => y))
     {
         if (!byYear.TryGetValue(kind, out var rows) || !rows.TryGetValue(year, out var list)) continue;
         list.Sort((a, b) => b.Votes.CompareTo(a.Votes));
-        picked.AddRange(list.Take(YearQuota(quota, year)));
+        picked.AddRange(list.Take(YearQuota(quota, year) + margin));
     }
-    selected[kind] = picked;
-    Console.WriteLine($"  {kind}: {picked.Count:N0} отобрано ({picked.Select(r => r.Year).Distinct().Count()} лет)");
+    candidates[kind] = picked;
+    Console.WriteLine($"  {kind}: {picked.Count:N0} кандидатов");
 }
 
 // ---- TMDB enrichment (cached) ----------------------------------------------
@@ -106,7 +115,7 @@ var cache = File.Exists(cachePath)
     ? JsonSerializer.Deserialize<Dictionary<string, TmdbEntry>>(File.ReadAllText(cachePath)) ?? new()
     : new Dictionary<string, TmdbEntry>();
 
-var missing = selected.Values.SelectMany(l => l)
+var missing = candidates.Values.SelectMany(l => l)
     .Where(r =>
     {
         // An entry with no data and no NotFound marker is an empty shell —
@@ -143,6 +152,33 @@ var tasks = missing.Select(async row =>
 await Task.WhenAll(tasks);
 Console.WriteLine($"\r  TMDB {done}/{missing.Count} готово   ");
 SaveCache(cachePath, cache);
+
+// Pass 2: keep only titles with a RU description (the one the app displays),
+// backfilling each year from the remaining overselected candidates.
+var selected = new Dictionary<string, List<TitleRow>>();
+foreach (var (kind, quota, firstYear, _) in kindConfigs)
+{
+    var final = new List<TitleRow>();
+    var dropped = 0;
+    foreach (var year in Enumerable.Range(firstYear, currentYear - firstYear + 1).OrderBy(y => y))
+    {
+        var taken = 0;
+        var quotaY = YearQuota(quota, year);
+        foreach (var row in candidates[kind])
+        {
+            if (row.Year != year) continue;
+            if (taken == quotaY) break;
+            if (cache.TryGetValue(row.ImdbId, out var tmdb) && !string.IsNullOrWhiteSpace(tmdb.OverviewRu))
+            {
+                final.Add(row);
+                taken++;
+            }
+            else dropped++;
+        }
+    }
+    selected[kind] = final;
+    Console.WriteLine($"  {kind}: {final.Count:N0} отобрано, {dropped} без описания исключено");
+}
 
 // ---- output ----------------------------------------------------------------
 
