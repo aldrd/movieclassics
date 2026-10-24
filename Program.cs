@@ -124,7 +124,7 @@ var tasks = missing.Select(async row =>
         if (n % 100 == 0)
         {
             Console.Write($"\r  TMDB {n}/{missing.Count}");
-            SaveCache(cachePath, cache);
+            lock (saveLock) { SaveCache(cachePath, cache); }
         }
     }
     catch (Exception ex)
