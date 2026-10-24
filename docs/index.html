@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Киноклассика</title>
+<meta name="theme-color" content="#1c1c1e">
+<style>
+  :root {
+    --bg: #1c1c1e; --card: #2c2c2e; --fill: #3a3a3c; --accent: #0a84ff;
+    --text: #ffffff; --secondary: #ebebf5; --tertiary: #8e8e93;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, 'Segoe UI', Roboto, sans-serif; padding: 16px 14px 80px; }
+  header { position: sticky; top: 0; background: var(--bg); padding-bottom: 10px; z-index: 5; border-bottom: 1px solid #2c2c2e; }
+  h1 { font-size: 22px; letter-spacing: -0.3px; display: flex; align-items: baseline; gap: 10px; }
+  h1 small { color: var(--tertiary); font-size: 13px; font-weight: 400; }
+  .controls { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .tabs button { background: var(--fill); color: var(--secondary); border: 0; border-radius: 14px; padding: 8px 14px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .tabs button.active { background: var(--accent); color: #fff; }
+  #search { flex: 1; min-width: 160px; background: var(--fill); border: 0; border-radius: 14px; color: var(--text); padding: 9px 14px; font-size: 14px; }
+  #years { display: flex; gap: 6px; overflow-x: auto; margin-top: 10px; padding-bottom: 6px; scrollbar-width: thin; }
+  #years button { background: transparent; color: var(--tertiary); border: 1px solid var(--fill); border-radius: 10px; padding: 5px 10px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+  #years button:hover { color: var(--text); }
+  h2 { font-size: 18px; margin: 24px 0 6px; display: flex; align-items: baseline; gap: 8px; scroll-margin-top: 140px; }
+  h2 .count { color: var(--tertiary); font-size: 13px; font-weight: 400; }
+  .row { background: var(--card); border-radius: 12px; padding: 8px 10px; margin: 8px 0; display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+  .row img { width: 46px; min-width: 46px; aspect-ratio: 2/3; object-fit: cover; border-radius: 6px; background: var(--fill); }
+  .info { flex: 1; min-width: 0; }
+  .title { font-weight: 700; font-size: 15px; }
+  .title a { color: var(--text); text-decoration: none; }
+  .title a:hover { color: var(--accent); }
+  .sub { color: var(--tertiary); font-size: 12px; font-weight: 600; margin-top: 2px; }
+  .desc { color: var(--secondary); font-size: 13px; margin-top: 6px; display: none; }
+  .row.open .desc { display: block; }
+  .rank { color: var(--tertiary); font-size: 12px; font-weight: 700; min-width: 22px; padding-top: 2px; text-align: right; }
+  .meta { color: var(--tertiary); font-size: 12px; margin: 6px 2px 0; text-align: center; }
+  .status { color: var(--tertiary); font-size: 13px; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Киноклассика <small id="meta"></small></h1>
+  <div class="controls">
+    <div class="tabs">
+      <button id="tabMovies" class="active">Фильмы</button>
+      <button id="tabSeries">Сериалы</button>
+    </div>
+    <input id="search" placeholder="Поиск по названию…">
+  </div>
+  <div id="years"></div>
+</header>
+<main id="content"><div class="status">Загружаю…</div></main>
+<div class="meta" id="footer"></div>
+
+<script>
+let movies = [], series = [], mode = 'movies', query = '';
+
+const fmtVotes = n => n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1).replace('.', ',') + 'K' : n;
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function render() {
+  const items = (mode === 'movies' ? movies : series)
+    .filter(m => !query || (m.titleRu || '').toLowerCase().includes(query) || (m.titleEn || '').toLowerCase().includes(query));
+  const years = [...new Set(items.map(m => m.year))].sort((a, b) => b - a);
+
+  const yearsBar = document.getElementById('years');
+  yearsBar.replaceChildren(...years.map(y => {
+    const b = document.createElement('button');
+    b.textContent = y;
+    b.onclick = () => document.getElementById('y' + y)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return b;
+  }));
+
+  const main = document.getElementById('content');
+  const frag = document.createDocumentFragment();
+  for (const year of years) {
+    const list = items.filter(m => m.year === year);
+    const h = document.createElement('h2');
+    h.id = 'y' + year;
+    h.innerHTML = `${year}<span class="count">${list.length}</span>`;
+    frag.append(h);
+    let rank = 0;
+    for (const m of list) {
+      rank++;
+      const row = document.createElement('div');
+      row.className = 'row';
+      const title = m.titleRu || m.titleEn || m.titleOriginal;
+      const sub = [
+        m.titleRu && m.titleEn && m.titleRu !== m.titleEn ? m.titleEn : m.titleOriginal,
+        '★ ' + m.rating,
+        fmtVotes(m.votes) + ' голосов'
+      ].filter(Boolean).join(' · ');
+      row.innerHTML = `
+        <div class="rank">${rank}</div>
+        ${m.posterSmall ? `<img loading="lazy" src="${esc(m.posterSmall)}" alt="">` : ''}
+        <div class="info">
+          <div class="title"><a href="https://www.imdb.com/title/${esc(m.imdbId)}/" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(title)}</a></div>
+          <div class="sub">${esc(sub)}</div>
+          <div class="desc">${esc(m.overviewRu || m.overviewEn || '')}</div>
+        </div>`;
+      row.onclick = () => row.classList.toggle('open');
+      frag.append(row);
+    }
+  }
+  main.replaceChildren(frag);
+}
+
+async function load() {
+  const [m, s, meta] = await Promise.all([
+    fetch('data/movies.json').then(r => r.json()),
+    fetch('data/series.json').then(r => r.json()),
+    fetch('data/meta.json').then(r => r.json()).catch(() => null)
+  ]);
+  movies = m; series = s;
+  if (meta) {
+    document.getElementById('meta').textContent =
+      `${meta.movies} фильмов с ${meta.movieFirstYear} · ${meta.series} сериалов с ${meta.seriesFirstYear}`;
+    document.getElementById('footer').textContent =
+      'Обновлено ' + new Date(meta.generatedAt).toLocaleString('ru-RU');
+  }
+  render();
+}
+
+document.getElementById('tabMovies').onclick = e => { mode = 'movies'; e.target.classList.add('active'); document.getElementById('tabSeries').classList.remove('active'); render(); };
+document.getElementById('tabSeries').onclick = e => { mode = 'series'; e.target.classList.add('active'); document.getElementById('tabMovies').classList.remove('active'); render(); };
+document.getElementById('search').oninput = e => { query = e.target.value.trim().toLowerCase(); render(); };
+
+load().catch(e => { document.getElementById('content').replaceChildren(); document.getElementById('content').innerHTML = '<div class="status">Не удалось загрузить данные: ' + esc(e.message) + '</div>'; });
+</script>
+</body>
+</html>
