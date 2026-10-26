@@ -228,6 +228,35 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
                       $"{droppedNoDescription} без описания исключено");
 }
 
+// ---- age ratings (cached; only titles that made the tops) -------------------
+
+var certWork = selected.Values.SelectMany(l => l)
+    .Where(r => cache.TryGetValue(r.ImdbId, out var e) && e.TmdbId != null && e.Certifications == null)
+    .ToList();
+Console.WriteLine($"Возрастные рейтинги: {certWork.Count:N0} новых");
+var certDone = 0;
+await Task.WhenAll(certWork.Select(async row =>
+{
+    await gate.WaitAsync();
+    try
+    {
+        var entry = cache[row.ImdbId];
+        entry.Certifications = await FetchCertificationsAsync(http, row, entry.TmdbId!.Value);
+        if (Interlocked.Increment(ref certDone) % 500 == 0)
+        {
+            Console.Write($"\r  рейтинги {certDone}/{certWork.Count}");
+            lock (saveLock) { SaveCache(cachePath, cache); }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n  ! {row.ImdbId} рейтинг: {ex.Message}");
+    }
+    finally { gate.Release(); }
+}));
+SaveCache(cachePath, cache);
+Console.WriteLine($"\r  рейтинги {certDone}/{certWork.Count} готово   ");
+
 // ---- output ----------------------------------------------------------------
 
 var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -259,7 +288,8 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
             ["overviewEn"] = tmdb?.OverviewEn,
             ["overviewRu"] = tmdb?.OverviewRu,
             ["poster"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w500" + tmdb.PosterPath,
-            ["posterSmall"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w185" + tmdb.PosterPath
+            ["posterSmall"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w185" + tmdb.PosterPath,
+            ["kids"] = IsForKids(row, tmdb?.Certifications) ? true : null
         });
     }
     var path = Path.Combine(docsDir, "data", fileName);
@@ -278,7 +308,8 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
         ["titleEn"] = m["titleEn"],
         ["titleRu"] = m["titleRu"],
         ["overviewRu"] = m["overviewRu"],
-        ["posterSmall"] = m["posterSmall"]
+        ["posterSmall"] = m["posterSmall"],
+        ["kids"] = m["kids"]
     };
 
     var slimPath = Path.Combine(docsDir, "data", kind == "movie" ? "movies-slim.json" : "series-slim.json");
@@ -298,6 +329,8 @@ var meta = new
     generatedAt = DateTime.UtcNow.ToString("o"),
     movies = selected["movie"].Count,
     series = selected["series"].Count,
+    kidsMovies = selected["movie"].Count(r => IsForKids(r, cache.GetValueOrDefault(r.ImdbId)?.Certifications)),
+    kidsSeries = selected["series"].Count(r => IsForKids(r, cache.GetValueOrDefault(r.ImdbId)?.Certifications)),
     movieFirstYear = movieFirst,
     seriesFirstYear = seriesFirst,
     currentYearQuotaMovies = YearQuota(MovieYearQuota, currentYear),
@@ -377,7 +410,8 @@ static IEnumerable<TitleRow> ReadBasics(string path, Dictionary<string, (double 
 
         if (!votes.TryGetValue(f[0], out var v)) continue;
 
-        yield return new TitleRow(f[0], kind, year, f[2], f[3] == @"\N" ? f[2] : f[3], v.Rating, v.Count);
+        var genres = f.Length > 8 && f[8] != @"\N" ? f[8].Split(',') : Array.Empty<string>();
+        yield return new TitleRow(f[0], kind, year, f[2], f[3] == @"\N" ? f[2] : f[3], v.Rating, v.Count, genres);
     }
 }
 
@@ -426,10 +460,78 @@ static async Task FetchReleaseDateAsync(HttpClient client, TitleRow row, TmdbEnt
     entry.NoReleaseDate = string.IsNullOrWhiteSpace(entry.ReleaseDate);
 }
 
+// Age ratings from TMDB for the countries whose systems say "for children".
+static async Task<List<string>> FetchCertificationsAsync(HttpClient client, TitleRow row, int tmdbId)
+{
+    var result = new List<string>();
+    var wanted = new HashSet<string> { "US", "RU", "DE", "GB" };
+    if (row.Kind == "movie")
+    {
+        using var doc = JsonDocument.Parse(await client.GetStringAsync(
+            $"https://api.themoviedb.org/3/movie/{tmdbId}/release_dates?api_key={TmdbKey}"));
+        foreach (var country in doc.RootElement.GetProperty("results").EnumerateArray())
+        {
+            var code = country.GetProperty("iso_3166_1").GetString() ?? "";
+            if (!wanted.Contains(code)) continue;
+            foreach (var release in country.GetProperty("release_dates").EnumerateArray())
+            {
+                var cert = release.GetProperty("certification").GetString();
+                if (!string.IsNullOrWhiteSpace(cert)) result.Add($"{code}:{cert.Trim()}");
+            }
+        }
+    }
+    else
+    {
+        using var doc = JsonDocument.Parse(await client.GetStringAsync(
+            $"https://api.themoviedb.org/3/tv/{tmdbId}/content_ratings?api_key={TmdbKey}"));
+        foreach (var country in doc.RootElement.GetProperty("results").EnumerateArray())
+        {
+            var code = country.GetProperty("iso_3166_1").GetString() ?? "";
+            var rating = country.GetProperty("rating").GetString();
+            if (wanted.Contains(code) && !string.IsNullOrWhiteSpace(rating)) result.Add($"{code}:{rating.Trim()}");
+        }
+    }
+    return result.Distinct().ToList();
+}
+
+// Children's titles: an age rating that says so; PG only together with a
+// family/animation genre (old PG films include Jaws); without any rating a
+// family genre with nothing dark in it. Animation alone is not enough —
+// plenty of anime is for adults.
+static bool IsForKids(TitleRow row, List<string>? certs)
+{
+    var dark = row.Genres.Any(g => g is "Horror" or "Crime" or "War" or "Thriller");
+    var family = row.Genres.Contains("Family");
+    var familyish = family || row.Genres.Contains("Animation");
+    // A mild rating alone means "safe", not "for children": old dramas and
+    // westerns are rated G on re-release, car shows TV-G. Without a family
+    // or animation genre it needs a light genre and nothing grown-up.
+    var light = row.Genres.Any(g => g is "Adventure" or "Fantasy" or "Comedy" or "Musical");
+    var grownUp = row.Genres.Any(g => g is "Drama" or "Biography" or "History" or "Western" or "Documentary"
+        or "Romance" or "Talk-Show" or "Reality-TV" or "News" or "Game-Show" or "Sport");
+    if (certs is { Count: > 0 })
+    {
+        if (certs.Any(c => c is "US:G" or "US:TV-Y" or "US:TV-Y7" or "US:TV-G" or "RU:0+" or "RU:6+" or "DE:0" or "GB:U"))
+        {
+            return !dark && (familyish || (light && !grownUp));
+        }
+        if (certs.Any(c => c is "US:PG" or "DE:6" or "GB:PG"))
+        {
+            return familyish && !dark;
+        }
+        // Rated, but only for teens or adults.
+        if (certs.Any(c => c.StartsWith("US:") || c.StartsWith("RU:") || c.StartsWith("DE:") || c.StartsWith("GB:")))
+        {
+            return false;
+        }
+    }
+    return family && !dark;
+}
+
 static string? FirstNonEmpty(string? first, string? second) =>
     !string.IsNullOrWhiteSpace(first) ? first : (string.IsNullOrWhiteSpace(second) ? null : second);
 
-internal sealed record TitleRow(string ImdbId, string Kind, int Year, string Title, string OriginalTitle, double Rating, int Votes);
+internal sealed record TitleRow(string ImdbId, string Kind, int Year, string Title, string OriginalTitle, double Rating, int Votes, string[] Genres);
 
 internal sealed class TmdbEntry
 {
@@ -444,6 +546,8 @@ internal sealed class TmdbEntry
     public string? ReleaseDate { get; set; }
     public bool NoReleaseDate { get; set; }
     public bool NotFound { get; set; }
+    // Age ratings as "US:PG", "RU:6+", "DE:0"…; null = not fetched yet.
+    public List<string>? Certifications { get; set; }
 }
 
 internal sealed class FindResponse
