@@ -29,6 +29,13 @@ const int SeriesYearQuota = 50;
 // that missed the votes part. Candidates are overfetched to the whole
 // top-200 so the rating picks (and description backfill) are covered.
 const int PoolPerYear = 200;
+// Kids movies: a top of their own on the same principle, 25 a year (20 by
+// votes + 5 by rating). The pool is the year's most voted movies whose
+// genres could pass the kids rule; the age rating is checked after TMDB.
+// Fewer than 25 when the year has no more with a description and a poster.
+const int KidsYearQuota = 25;
+const int KidsPoolPerYear = 100;
+const int KidsMinVotes = 1000;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -108,6 +115,16 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
     Console.WriteLine($"  {kind}: {picked.Count:N0} кандидатов (топ-{PoolPerYear} года)");
 }
 
+var kidsCandidates = new List<TitleRow>();
+foreach (var year in Enumerable.Range(movieFirst, currentYear - movieFirst + 1))
+{
+    if (!byYear.TryGetValue("movie", out var rows) || !rows.TryGetValue(year, out var list)) continue;
+    kidsCandidates.AddRange(list // votes desc already
+        .Where(r => r.Votes >= KidsMinVotes && MaybeForKids(r))
+        .Take(KidsPoolPerYear));
+}
+Console.WriteLine($"  kids: {kidsCandidates.Count:N0} кандидатов (топ-{KidsPoolPerYear} года по жанрам)");
+
 // ---- TMDB enrichment (cached) ----------------------------------------------
 
 var cachePath = Path.Combine(cacheDir, "tmdb-cache.json");
@@ -124,7 +141,7 @@ Console.WriteLine($"  кэш: {cache.Count:N0} записей, " +
                   $"{cache.Values.Count(e => e.ReleaseDate != null):N0} с датой");
 
 var work = new List<(TitleRow Row, bool DateOnly, TmdbEntry? Entry)>();
-foreach (var row in candidates.Values.SelectMany(l => l))
+foreach (var row in candidates.Values.SelectMany(l => l).Concat(kidsCandidates).DistinctBy(r => r.ImdbId))
 {
     if (!cache.TryGetValue(row.ImdbId, out var entry) || (entry.TmdbId == null && !entry.NotFound))
     {
@@ -230,7 +247,7 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
 
 // ---- age ratings (cached; only titles that made the tops) -------------------
 
-var certWork = selected.Values.SelectMany(l => l)
+var certWork = selected.Values.SelectMany(l => l).Concat(kidsCandidates).DistinctBy(r => r.ImdbId)
     .Where(r => cache.TryGetValue(r.ImdbId, out var e) && e.TmdbId != null && e.Certifications == null)
     .ToList();
 Console.WriteLine($"Возрастные рейтинги: {certWork.Count:N0} новых");
@@ -257,6 +274,30 @@ await Task.WhenAll(certWork.Select(async row =>
 SaveCache(cachePath, cache);
 Console.WriteLine($"\r  рейтинги {certDone}/{certWork.Count} готово   ");
 
+// Kids top: 80% most voted, the rest highest rated of the remaining pool;
+// only titles the age rating confirms, with a RU description and a poster.
+var kidsSelected = new List<TitleRow>();
+foreach (var year in Enumerable.Range(movieFirst, currentYear - movieFirst + 1))
+{
+    var quotaY = YearQuota(KidsYearQuota, year);
+    var votesQuota = (int)Math.Round(quotaY * 0.8);
+    var pool = kidsCandidates
+        .Where(r => r.Year == year && cache.TryGetValue(r.ImdbId, out var e) &&
+                    !string.IsNullOrWhiteSpace(e.OverviewRu) && e.PosterPath != null &&
+                    IsForKids(r, e.Certifications))
+        .ToList();
+    var votesPart = pool.Take(votesQuota).ToList();
+    var ratingPart = pool.Skip(votesQuota)
+        .OrderByDescending(r => r.Rating)
+        .ThenByDescending(r => r.Votes)
+        .Take(quotaY - votesPart.Count)
+        .ToList();
+    kidsSelected.AddRange(votesPart.Concat(ratingPart)
+        .OrderBy(r => cache[r.ImdbId].ReleaseDate ?? "9999-99-99")
+        .ThenByDescending(r => r.Votes));
+}
+Console.WriteLine($"  kids: {kidsSelected.Count:N0} отобрано");
+
 // ---- output ----------------------------------------------------------------
 
 var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -267,7 +308,8 @@ var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web)
     Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
 };
 
-foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "series.json") })
+selected["kids"] = kidsSelected;
+foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "series.json"), ("kids", "kids-movies.json") })
 {
     var items = new List<Dictionary<string, object?>>();
     foreach (var row in selected[kind]) // year asc, release date asc inside a year
@@ -277,7 +319,7 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
         {
             ["imdbId"] = row.ImdbId,
             ["tmdbId"] = tmdb?.TmdbId,
-            ["kind"] = kind == "movie" ? "фильм" : "сериал",
+            ["kind"] = kind == "series" ? "сериал" : "фильм",
             ["year"] = row.Year,
             ["releaseDate"] = tmdb?.ReleaseDate,
             ["rating"] = row.Rating,
@@ -288,8 +330,7 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
             ["overviewEn"] = tmdb?.OverviewEn,
             ["overviewRu"] = tmdb?.OverviewRu,
             ["poster"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w500" + tmdb.PosterPath,
-            ["posterSmall"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w185" + tmdb.PosterPath,
-            ["kids"] = IsForKids(row, tmdb?.Certifications) ? true : null
+            ["posterSmall"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w185" + tmdb.PosterPath
         });
     }
     var path = Path.Combine(docsDir, "data", fileName);
@@ -308,17 +349,16 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
         ["titleEn"] = m["titleEn"],
         ["titleRu"] = m["titleRu"],
         ["overviewRu"] = m["overviewRu"],
-        ["posterSmall"] = m["posterSmall"],
-        ["kids"] = m["kids"]
+        ["posterSmall"] = m["posterSmall"]
     };
 
-    var slimPath = Path.Combine(docsDir, "data", kind == "movie" ? "movies-slim.json" : "series-slim.json");
+    var slimPath = Path.Combine(docsDir, "data", fileName.Replace(".json", "-slim.json"));
     File.WriteAllText(slimPath, JsonSerializer.Serialize(items.Select(ToAppShape), jsonOpts));
     Console.WriteLine($"  {Path.GetFileName(slimPath)}: {items.Count:N0} записей");
 
     // Tail with just the newest 50: the app shows it instantly while the
     // full file downloads in the background.
-    var latestPath = Path.Combine(docsDir, "data", kind == "movie" ? "movies-latest.json" : "series-latest.json");
+    var latestPath = Path.Combine(docsDir, "data", fileName.Replace(".json", "-latest.json"));
     var latest = items.Skip(Math.Max(0, items.Count - 50)).Select(ToAppShape);
     File.WriteAllText(latestPath, JsonSerializer.Serialize(latest, jsonOpts));
     Console.WriteLine($"  {Path.GetFileName(latestPath)}: {items.Skip(Math.Max(0, items.Count - 50)).Count():N0} записей");
@@ -329,8 +369,7 @@ var meta = new
     generatedAt = DateTime.UtcNow.ToString("o"),
     movies = selected["movie"].Count,
     series = selected["series"].Count,
-    kidsMovies = selected["movie"].Count(r => IsForKids(r, cache.GetValueOrDefault(r.ImdbId)?.Certifications)),
-    kidsSeries = selected["series"].Count(r => IsForKids(r, cache.GetValueOrDefault(r.ImdbId)?.Certifications)),
+    kidsMovies = kidsSelected.Count,
     movieFirstYear = movieFirst,
     seriesFirstYear = seriesFirst,
     currentYearQuotaMovies = YearQuota(MovieYearQuota, currentYear),
@@ -526,6 +565,17 @@ static bool IsForKids(TitleRow row, List<string>? certs)
         }
     }
     return family && !dark;
+}
+
+// Genres alone could still make a kids title (before the age rating is known).
+static bool MaybeForKids(TitleRow row)
+{
+    var g = row.Genres;
+    if (g.Any(x => x is "Horror" or "Crime" or "War" or "Thriller")) return false;
+    var light = g.Any(x => x is "Adventure" or "Fantasy" or "Comedy" or "Musical");
+    var grownUp = g.Any(x => x is "Drama" or "Biography" or "History" or "Western" or "Documentary"
+        or "Romance" or "Talk-Show" or "Reality-TV" or "News" or "Game-Show" or "Sport");
+    return g.Contains("Family") || g.Contains("Animation") || (light && !grownUp);
 }
 
 static string? FirstNonEmpty(string? first, string? second) =>
