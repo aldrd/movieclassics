@@ -83,6 +83,77 @@ foreach (var (tconst, rating, count) in ReadRatings(ratingsPath))
 }
 Console.WriteLine($"  {votes.Count:N0} титлов с рейтингом");
 
+// ---- search catalog (one-off: dotnet run -- --catalog) -----------------------
+// The most voted 20 000 movies and 10 000 series of all years, as a compact
+// TSV the app ships for title hints: tt-id, year, m/s, votes, RU title, EN title,
+// original title (empty when the same as EN), poster path.
+if (args.Contains("--catalog"))
+{
+    const int CatalogMovies = 20_000;
+    const int CatalogSeries = 10_000;
+    var all = ReadBasics(basicsPath, votes, 1890, 1940, currentYear).ToList();
+    var picks = all.Where(r => r.Kind == "movie").OrderByDescending(r => r.Votes).Take(CatalogMovies)
+        .Concat(all.Where(r => r.Kind == "series").OrderByDescending(r => r.Votes).Take(CatalogSeries))
+        .ToList();
+
+    var catalogCachePath = Path.Combine(cacheDir, "tmdb-cache.json");
+    var catalogCache = File.Exists(catalogCachePath)
+        ? JsonSerializer.Deserialize<Dictionary<string, TmdbEntry>>(File.ReadAllText(catalogCachePath), new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? new()
+        : new Dictionary<string, TmdbEntry>();
+    var missing = picks.Where(r => !catalogCache.TryGetValue(r.ImdbId, out var e) || (e.TmdbId == null && !e.NotFound)).ToList();
+    Console.WriteLine($"Каталог: {picks.Count:N0} титлов, {missing.Count:N0} без данных TMDB");
+
+    var catalogGate = new SemaphoreSlim(8);
+    var catalogLock = new object();
+    var fetched = 0;
+    await Task.WhenAll(missing.Select(async row =>
+    {
+        await catalogGate.WaitAsync();
+        try
+        {
+            var entry = await FetchTmdbAsync(http, row);
+            lock (catalogLock)
+            {
+                catalogCache[row.ImdbId] = entry;
+                if (++fetched % 500 == 0)
+                {
+                    Console.Write($"\r  TMDB {fetched}/{missing.Count}");
+                    SaveCache(catalogCachePath, catalogCache);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n  ! {row.ImdbId} {row.Title}: {ex.Message}");
+        }
+        finally { catalogGate.Release(); }
+    }));
+    SaveCache(catalogCachePath, catalogCache);
+    Console.WriteLine($"\r  TMDB {fetched}/{missing.Count} готово   ");
+
+    static string Clean(string? text) => (text ?? string.Empty).Replace('\t', ' ').Replace('\n', ' ').Trim();
+    var lines = picks.Select(row =>
+    {
+        catalogCache.TryGetValue(row.ImdbId, out var e);
+        var en = Clean(e?.TitleEn ?? row.Title);
+        var ru = Clean(e?.TitleRu);
+        var original = Clean(row.OriginalTitle);
+        return string.Join('\t',
+            row.ImdbId[2..],
+            row.Year,
+            row.Kind == "movie" ? "m" : "s",
+            row.Votes,
+            ru == en ? string.Empty : ru,
+            en,
+            original == en ? string.Empty : original,
+            e?.PosterPath ?? string.Empty);
+    });
+    var catalogPath = Path.Combine(docsDir, "data", "catalog.tsv");
+    File.WriteAllText(catalogPath, string.Join('\n', lines), new UTF8Encoding(false));
+    Console.WriteLine($"Готово: {catalogPath} ({new FileInfo(catalogPath).Length / 1024:N0} КБ)");
+    return;
+}
+
 Console.WriteLine("Читаю базу титлов…");
 int movieFirst = smoke ? currentYear - 2 : MovieFirstYear;
 int seriesFirst = smoke ? currentYear - 2 : SeriesFirstYear;
