@@ -3,3 +3,4 @@ obj/
 cache/
 *.user
 logs/
+kp.key

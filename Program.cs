@@ -39,6 +39,13 @@ const int KidsMinVotes = 1000;
 // Titles rated below this never enter a top: the next candidate of the year
 // takes the slot.
 const double MinRating = 5.0;
+// Russian tops from Kinopoisk (poiskkino.dev API), shown merged with the
+// IMDb tops in the Russian UI: the same yearly principle, rated by KP.
+const int RuMovieYearQuota = 20;
+const int RuSeriesYearQuota = 10;
+const int RuPoolPerYear = 100;
+const int RuMinVotes = 1000;        // past years
+const int RuMinVotesCurrent = 100;  // the current year is still gathering votes
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -438,6 +445,160 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
     Console.WriteLine($"  {Path.GetFileName(latestPath)}: {items.Skip(Math.Max(0, items.Count - 50)).Count():N0} записей");
 }
 
+// ---- Russian tops (Kinopoisk) ------------------------------------------------
+// The key lives in kp.key (not in git). The first run downloads every Russian
+// title with enough votes (a few dozen requests); later runs refresh only the
+// current year. Requests go slowly, one at a time.
+
+var kpKeyPath = Path.Combine(root, "kp.key");
+var ruCounts = new Dictionary<string, int>();
+if (File.Exists(kpKeyPath) && !smoke)
+{
+    var kpKey = File.ReadAllText(kpKeyPath).Trim();
+    var kpDir = Path.Combine(cacheDir, "kp");
+    Directory.CreateDirectory(kpDir);
+    foreach (var (kind, types, quota, fileName) in new[]
+             {
+                 ("movie", new[] { "movie", "cartoon" }, RuMovieYearQuota, "ru-movies.json"),
+                 ("series", new[] { "tv-series", "animated-series" }, RuSeriesYearQuota, "ru-series.json")
+             })
+    {
+        var kpCachePath = Path.Combine(kpDir, $"{kind}.json");
+        var known = File.Exists(kpCachePath)
+            ? JsonSerializer.Deserialize<Dictionary<int, KpTitle>>(File.ReadAllText(kpCachePath)) ?? new()
+            : new Dictionary<int, KpTitle>();
+        var fresh = new List<KpTitle>();
+        try
+        {
+            // Everything once (year ranges small enough for the free tier's
+            // 10 pages), then the current year every day.
+            var fullMark = Path.Combine(kpDir, $"{kind}.full");
+            if (!File.Exists(fullMark))
+            {
+                await FetchKpRangeAsync(kpKey, types, 1900, currentYear, RuMinVotes, fresh);
+                File.WriteAllText(fullMark, DateTime.UtcNow.ToString("o")); // reached only without errors
+            }
+            else
+            {
+                await FetchKpRangeAsync(kpKey, types, currentYear, currentYear, RuMinVotesCurrent, fresh);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ! КП {kind}: {ex.Message}");
+        }
+        // What arrived is kept, also after a failure.
+        foreach (var title in fresh)
+        {
+            known[title.Id] = title;
+        }
+        File.WriteAllText(kpCachePath, JsonSerializer.Serialize(known));
+        Console.WriteLine($"  КП {kind}: {fresh.Count:N0} загружено, {known.Count:N0} в кэше");
+
+        // Per year: 80% most voted, the rest highest rated of the year's
+        // most voted; only with a description and a poster, rated 5+.
+        var ruSelected = new List<KpTitle>();
+        foreach (var yearGroup in known.Values.Where(t => t.Year >= 1900 && t.Year <= currentYear).GroupBy(t => t.Year).OrderBy(g => g.Key))
+        {
+            var quotaY = YearQuota(quota, yearGroup.Key);
+            var votesQuota = (int)Math.Round(quotaY * 0.8);
+            var pool = yearGroup
+                .Where(t => t.Rating >= MinRating && !string.IsNullOrWhiteSpace(t.Description) && t.Poster != null)
+                .OrderByDescending(t => t.Votes)
+                .Take(RuPoolPerYear)
+                .ToList();
+            var votesPart = pool.Take(votesQuota).ToList();
+            var ratingPart = pool.Skip(votesQuota).OrderByDescending(t => t.Rating).ThenByDescending(t => t.Votes)
+                .Take(quotaY - votesPart.Count).ToList();
+            ruSelected.AddRange(votesPart.Concat(ratingPart)
+                .OrderBy(t => t.ReleaseDate ?? "9999-99-99")
+                .ThenByDescending(t => t.Votes));
+        }
+        ruCounts[kind] = ruSelected.Count;
+
+        // The app's shape; titles without an IMDb id are keyed "kp<id>".
+        var ruItems = ruSelected.Select(t => new Dictionary<string, object?>
+        {
+            ["imdbId"] = t.ImdbId ?? $"kp{t.Id}",
+            ["kpId"] = t.Id,
+            ["year"] = t.Year,
+            ["releaseDate"] = t.ReleaseDate,
+            ["rating"] = Math.Round(t.Rating, 1),
+            ["kpRating"] = Math.Round(t.Rating, 1),
+            ["votes"] = t.Votes,
+            ["titleOriginal"] = t.TitleOriginal,
+            ["titleEn"] = t.TitleEn,
+            ["titleRu"] = t.TitleRu,
+            ["overviewRu"] = t.Description,
+            ["posterSmall"] = t.Poster
+        }).ToList();
+        File.WriteAllText(Path.Combine(docsDir, "data", fileName.Replace(".json", "-slim.json")), JsonSerializer.Serialize(ruItems, jsonOpts));
+        File.WriteAllText(Path.Combine(docsDir, "data", fileName.Replace(".json", "-latest.json")),
+            JsonSerializer.Serialize(ruItems.Skip(Math.Max(0, ruItems.Count - 50)), jsonOpts));
+        Console.WriteLine($"  {fileName.Replace(".json", "-slim.json")}: {ruItems.Count:N0} записей");
+    }
+}
+else
+{
+    Console.WriteLine("КП: нет kp.key — российские топы не обновляются");
+}
+
+// Russian titles of these years: the free tier serves only 10 pages of a
+// query, so a range that has more is split in two. Whatever arrived before a
+// failure is kept (the caller saves it).
+async Task FetchKpRangeAsync(string key, string[] types, int from, int to, int minVotes, List<KpTitle> into)
+{
+    const int MaxPages = 10;
+    var pages = await FetchKpAsync(key, types, from, to, minVotes, into, MaxPages);
+    if (pages > MaxPages && from < to)
+    {
+        var middle = (from + to) / 2;
+        // The halves fetch their titles anew; duplicates collapse by id.
+        await FetchKpRangeAsync(key, types, from, middle, minVotes, into);
+        await FetchKpRangeAsync(key, types, middle + 1, to, minVotes, into);
+    }
+}
+
+// One query, up to maxPages pages; returns how many pages it has in all.
+async Task<int> FetchKpAsync(string key, string[] types, int from, int to, int minVotes, List<KpTitle> result, int maxPages)
+{
+    var russia = Uri.EscapeDataString("Россия");
+    var query = $"limit=250&countries.name={russia}&votes.kp={minVotes}-999999999&sortField=votes.kp&sortType=-1" +
+                string.Concat(types.Select(t => $"&type={t}")) +
+                (from == to ? $"&year={from}" : $"&year={from}-{to}") +
+                string.Concat(new[] { "id", "name", "alternativeName", "enName", "year", "rating", "votes", "externalId",
+                    "premiere", "description", "shortDescription", "poster", "type" }.Select(f => $"&selectFields={f}"));
+    for (var page = 1; ; page++)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"https://api.poiskkino.dev/v1.4/movie?{query}&page={page}");
+        request.Headers.Add("X-API-KEY", key);
+        using var response = await http.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        foreach (var m in doc.RootElement.GetProperty("docs").EnumerateArray())
+        {
+            if (KpTitle.From(m) is { } title)
+            {
+                result.Add(title);
+            }
+        }
+
+        var pages = doc.RootElement.TryGetProperty("pages", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 1;
+        await Task.Delay(TimeSpan.FromSeconds(2)); // slowly
+        if (pages > maxPages && from < to)
+        {
+            // Too big for the free tier: the caller splits the range.
+            Console.WriteLine($"  КП {string.Join('/', types)} {from}-{to}: {pages} стр., делю");
+            return pages;
+        }
+        Console.WriteLine($"  КП {string.Join('/', types)} {from}-{to}: стр. {page}/{pages}");
+        if (page >= Math.Min(pages, maxPages))
+        {
+            return pages;
+        }
+    }
+}
+
 var meta = new
 {
     generatedAt = DateTime.UtcNow.ToString("o"),
@@ -447,7 +608,9 @@ var meta = new
     movieFirstYear = movieFirst,
     seriesFirstYear = seriesFirst,
     currentYearQuotaMovies = YearQuota(MovieYearQuota, currentYear),
-    currentYearQuotaSeries = YearQuota(SeriesYearQuota, currentYear)
+    currentYearQuotaSeries = YearQuota(SeriesYearQuota, currentYear),
+    ruMovies = ruCounts.GetValueOrDefault("movie"),
+    ruSeries = ruCounts.GetValueOrDefault("series")
 };
 File.WriteAllText(Path.Combine(docsDir, "data", "meta.json"), JsonSerializer.Serialize(meta, jsonOpts));
 
@@ -654,6 +817,49 @@ static bool MaybeForKids(TitleRow row)
 
 static string? FirstNonEmpty(string? first, string? second) =>
     !string.IsNullOrWhiteSpace(first) ? first : (string.IsNullOrWhiteSpace(second) ? null : second);
+
+/// <summary>A Russian title from the Kinopoisk API, as cached.</summary>
+internal sealed record KpTitle(int Id, int Year, string TitleRu, string? TitleEn, string TitleOriginal,
+    double Rating, int Votes, string? ImdbId, string? ReleaseDate, string? Description, string? Poster)
+{
+    public static KpTitle? From(JsonElement m)
+    {
+        static string? Str(JsonElement e, string name) =>
+            e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString() : null;
+        static double Num(JsonElement e, string name) =>
+            e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
+                ? v.GetDouble() : 0;
+        static JsonElement Obj(JsonElement e, string name) =>
+            e.TryGetProperty(name, out var v) ? v : default;
+
+        var name = Str(m, "name");
+        var year = (int)Num(m, "year");
+        if (string.IsNullOrWhiteSpace(name) || year == 0)
+        {
+            return null;
+        }
+
+        var premiere = Obj(m, "premiere");
+        var date = Str(premiere, "russia") ?? Str(premiere, "world");
+        var imdb = Str(Obj(m, "externalId"), "imdb");
+        var description = Str(m, "description");
+        if (string.IsNullOrWhiteSpace(description))
+        {
+            description = Str(m, "shortDescription");
+        }
+
+        return new KpTitle(
+            (int)Num(m, "id"), year, name,
+            Str(m, "enName"),
+            Str(m, "alternativeName") is { Length: > 0 } alt ? alt : Str(m, "enName") ?? name,
+            Num(Obj(m, "rating"), "kp"), (int)Num(Obj(m, "votes"), "kp"),
+            imdb is { Length: > 2 } && imdb.StartsWith("tt") ? imdb : null,
+            date is { Length: >= 10 } ? date[..10] : null,
+            description?.Trim(),
+            Str(Obj(m, "poster"), "previewUrl"));
+    }
+}
 
 internal sealed record TitleRow(string ImdbId, string Kind, int Year, string Title, string OriginalTitle, double Rating, int Votes, string[] Genres);
 
