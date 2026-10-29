@@ -36,6 +36,9 @@ const int PoolPerYear = 200;
 const int KidsYearQuota = 25;
 const int KidsPoolPerYear = 100;
 const int KidsMinVotes = 1000;
+// Titles rated below this never enter a top: the next candidate of the year
+// takes the slot.
+const double MinRating = 5.0;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -283,7 +286,7 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
         var votesQuota = (int)Math.Round(quotaY * 0.8);
         var ratingQuota = quotaY - votesQuota;
 
-        var pool = candidates[kind].Where(r => r.Year == year).ToList(); // votes desc already
+        var pool = candidates[kind].Where(r => r.Year == year && r.Rating >= MinRating).ToList(); // votes desc already
         bool HasRuDescription(TitleRow r) =>
             cache.TryGetValue(r.ImdbId, out var e) && !string.IsNullOrWhiteSpace(e.OverviewRu);
         string ReleaseDateOf(TitleRow r) =>
@@ -353,7 +356,7 @@ foreach (var year in Enumerable.Range(movieFirst, currentYear - movieFirst + 1))
     var quotaY = YearQuota(KidsYearQuota, year);
     var votesQuota = (int)Math.Round(quotaY * 0.8);
     var pool = kidsCandidates
-        .Where(r => r.Year == year && cache.TryGetValue(r.ImdbId, out var e) &&
+        .Where(r => r.Year == year && r.Rating >= MinRating && cache.TryGetValue(r.ImdbId, out var e) &&
                     !string.IsNullOrWhiteSpace(e.OverviewRu) && e.PosterPath != null &&
                     IsForKids(r, e.Certifications))
         .ToList();
