@@ -39,6 +39,12 @@ const int KidsMinVotes = 1000;
 // Titles rated below this never enter a top: the next candidate of the year
 // takes the slot.
 const double MinRating = 5.0;
+// New releases are still gathering votes and would miss the top until they
+// catch up: a title out less than three months with enough votes and a high
+// rating enters its year's top on top of the quota.
+const int FreshDays = 92;
+const int FreshMinVotes = 1000;
+const double FreshMinRating = 7.0;
 // Russian tops from Kinopoisk (poiskkino.dev API), shown merged with the
 // IMDb tops in the Russian UI: the same yearly principle, rated by KP.
 const int RuMovieYearQuota = 20;
@@ -183,6 +189,8 @@ var kindConfigs = new[]
 // Pass 1: the whole top-200 of each year by votes; the votes/rating split
 // and the description cut happen after TMDB enrichment.
 var candidates = new Dictionary<string, List<TitleRow>>();
+var freshCandidates = new HashSet<string>();
+bool MaybeFresh(TitleRow r) => r.Votes > FreshMinVotes && r.Rating > FreshMinRating;
 foreach (var (kind, quota, firstYear) in kindConfigs)
 {
     var picked = new List<TitleRow>();
@@ -191,6 +199,14 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
         if (!byYear.TryGetValue(kind, out var rows) || !rows.TryGetValue(year, out var list)) continue;
         list.Sort((a, b) => b.Votes.CompareTo(a.Votes));
         picked.AddRange(list.Take(PoolPerYear));
+        if (year >= currentYear - 1)
+        {
+            // Possible new releases past the top-200; their release date
+            // (TMDB) decides in pass 2.
+            var extra = list.Skip(PoolPerYear).Where(MaybeFresh).ToList();
+            picked.AddRange(extra);
+            freshCandidates.UnionWith(extra.Select(r => r.ImdbId));
+        }
     }
     candidates[kind] = picked;
     Console.WriteLine($"  {kind}: {picked.Count:N0} кандидатов (топ-{PoolPerYear} года)");
@@ -286,6 +302,7 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
     var droppedNoDescription = 0;
     var totalVotesPart = 0;
     var totalRatingPart = 0;
+    var totalFreshPart = 0;
 
     foreach (var year in Enumerable.Range(firstYear, currentYear - firstYear + 1).OrderBy(y => y))
     {
@@ -293,7 +310,8 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
         var votesQuota = (int)Math.Round(quotaY * 0.8);
         var ratingQuota = quotaY - votesQuota;
 
-        var pool = candidates[kind].Where(r => r.Year == year && r.Rating >= MinRating).ToList(); // votes desc already
+        var yearRows = candidates[kind].Where(r => r.Year == year && r.Rating >= MinRating).ToList();
+        var pool = yearRows.Where(r => !freshCandidates.Contains(r.ImdbId)).ToList(); // votes desc already
         bool HasRuDescription(TitleRow r) =>
             cache.TryGetValue(r.ImdbId, out var e) && !string.IsNullOrWhiteSpace(e.OverviewRu);
         string ReleaseDateOf(TitleRow r) =>
@@ -314,15 +332,28 @@ foreach (var (kind, quota, firstYear) in kindConfigs)
             .Take(ratingQuota)
             .ToList();
 
+        bool IsFresh(TitleRow r) =>
+            MaybeFresh(r) &&
+            cache.TryGetValue(r.ImdbId, out var e) &&
+            DateTime.TryParse(e.ReleaseDate, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out var released) &&
+            released <= DateTime.UtcNow.Date &&
+            released >= DateTime.UtcNow.Date.AddDays(-FreshDays);
+        var freshPart = yearRows.Except(votesPart).Except(ratingPart)
+            .Where(r => IsFresh(r) && HasRuDescription(r))
+            .ToList();
+
         totalVotesPart += votesPart.Count;
         totalRatingPart += ratingPart.Count;
-        final.AddRange(votesPart.Concat(ratingPart)
+        totalFreshPart += freshPart.Count;
+        final.AddRange(votesPart.Concat(ratingPart).Concat(freshPart)
             .OrderBy(ReleaseDateOf)
             .ThenByDescending(r => r.Votes));
     }
 
     selected[kind] = final;
-    Console.WriteLine($"  {kind}: {final.Count:N0} отобрано ({totalVotesPart} по голосам + {totalRatingPart} по рейтингу), " +
+    Console.WriteLine($"  {kind}: {final.Count:N0} отобрано ({totalVotesPart} по голосам + {totalRatingPart} по рейтингу + " +
+                      $"{totalFreshPart} новинок), " +
                       $"{droppedNoDescription} без описания исключено");
 }
 
