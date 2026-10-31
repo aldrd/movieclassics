@@ -40,9 +40,9 @@ const int KidsMinVotes = 1000;
 // takes the slot.
 const double MinRating = 5.0;
 // New releases are still gathering votes and would miss the top until they
-// catch up: a title out less than three months with enough votes and a high
+// catch up: a title out less than five months with enough votes and a high
 // rating enters its year's top on top of the quota.
-const int FreshDays = 92;
+const int FreshDays = 153;
 const int FreshMinVotes = 1000;
 const double FreshMinRating = 7.0;
 // Russian tops from Kinopoisk (poiskkino.dev API), shown merged with the
