@@ -88,8 +88,11 @@ http.DefaultRequestHeaders.UserAgent.ParseAdd("MovieClassics/1.0");
 
 var basicsPath = Path.Combine(cacheDir, "title.basics.tsv.gz");
 var ratingsPath = Path.Combine(cacheDir, "title.ratings.tsv.gz");
-await DownloadIfNeededAsync("title.basics.tsv.gz", basicsPath);
-await DownloadIfNeededAsync("title.ratings.tsv.gz", ratingsPath);
+// Votes change daily (new releases gain thousands a week), so the small
+// ratings file is fetched every run; the big titles file only weekly — a
+// title is listed there long before its release.
+await DownloadIfNeededAsync("title.ratings.tsv.gz", ratingsPath, TimeSpan.FromHours(20));
+await DownloadIfNeededAsync("title.basics.tsv.gz", basicsPath, TimeSpan.FromDays(7));
 
 Console.WriteLine("Читаю рейтинги…");
 var votes = new Dictionary<string, (double Rating, int Count)>();
@@ -649,9 +652,9 @@ Console.WriteLine("Готово: docs/data/*.json");
 
 // ---- helpers ---------------------------------------------------------------
 
-async Task DownloadIfNeededAsync(string name, string target)
+async Task DownloadIfNeededAsync(string name, string target, TimeSpan maxAge)
 {
-    if (File.Exists(target) && File.GetLastWriteTimeUtc(target) > DateTime.UtcNow.AddDays(-20))
+    if (File.Exists(target) && File.GetLastWriteTimeUtc(target) > DateTime.UtcNow - maxAge)
     {
         Console.WriteLine($"{name}: кэш свежий");
         return;
@@ -660,8 +663,13 @@ async Task DownloadIfNeededAsync(string name, string target)
     Console.Write($"Качаю {name}… ");
     using var resp = await http.GetAsync($"https://datasets.imdbws.com/{name}", HttpCompletionOption.ResponseHeadersRead);
     resp.EnsureSuccessStatusCode();
-    await using var fs = File.Create(target);
-    await resp.Content.CopyToAsync(fs);
+    // Into a temp file first: a broken download must not replace the cache.
+    var tmp = target + ".tmp";
+    await using (var fs = File.Create(tmp))
+    {
+        await resp.Content.CopyToAsync(fs);
+    }
+    File.Move(tmp, target, overwrite: true);
     Console.WriteLine($"{new FileInfo(target).Length / 1024 / 1024} МБ");
 }
 
@@ -709,7 +717,8 @@ static IEnumerable<TitleRow> ReadBasics(string path, Dictionary<string, (double 
         string kind;
         int firstYear;
         if (f[1] == "movie") { kind = "movie"; firstYear = movieFirst; }
-        else if (f[1] == "tvSeries") { kind = "series"; firstYear = seriesFirst; }
+        // Miniseries (Chernobyl, VisionQuest) are series too.
+        else if (f[1] is "tvSeries" or "tvMiniSeries") { kind = "series"; firstYear = seriesFirst; }
         else continue;
 
         if (f[5] == @"\N") continue; // startYear
