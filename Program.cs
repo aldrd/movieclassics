@@ -438,6 +438,71 @@ bool CurrentSeason(TmdbEntry? e) =>
 Console.WriteLine($"  сезон за год: {selected["series"].Count(r => CurrentSeason(cache.GetValueOrDefault(r.ImdbId)))} " +
                   $"(продолжений: {selected["series"].Count(r => CurrentSeason(cache.GetValueOrDefault(r.ImdbId)) && cache[r.ImdbId].Season > 1)})");
 
+// ---- people: who made the titles (the app's recommendations) ------------------
+// Directors and writers of movies rated above 6.5; for series rated above 7.2
+// the director, the writer and the creator (showrunner) — each only when the
+// series has one person in that role (a crew of many says nothing). Fetched
+// once per title and cached.
+
+const double PeopleMovieRating = 6.5;
+const double PeopleSeriesRating = 7.2;
+var peopleRows = selected["movie"].Where(r => r.Rating > PeopleMovieRating)
+    .Concat(selected["series"].Where(r => r.Rating > PeopleSeriesRating))
+    .Where(r => cache.TryGetValue(r.ImdbId, out var e) && e.TmdbId != null)
+    .ToList();
+var peopleWork = peopleRows.Where(r => cache[r.ImdbId].People == null).ToList();
+Console.WriteLine($"Создатели: {peopleWork.Count:N0} к загрузке из {peopleRows.Count:N0}");
+var peopleDone = 0;
+await Task.WhenAll(peopleWork.Select(async row =>
+{
+    await gate.WaitAsync();
+    try
+    {
+        var entry = cache[row.ImdbId];
+        entry.People = await FetchPeopleAsync(http, row.Kind, entry.TmdbId!.Value);
+        if (Interlocked.Increment(ref peopleDone) % 500 == 0)
+        {
+            Console.Write($"\r  создатели {peopleDone}/{peopleWork.Count}");
+            lock (saveLock) { SaveCache(cachePath, cache); }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n  ! {row.ImdbId} создатели: {ex.Message}");
+    }
+    finally { gate.Release(); }
+}));
+SaveCache(cachePath, cache);
+Console.WriteLine($"\r  создатели {peopleDone}/{peopleWork.Count} готово   ");
+
+// The link table: a person counts only when they connect two titles or more.
+var titlesByPerson = new Dictionary<int, List<string>>();
+foreach (var row in peopleRows)
+{
+    foreach (var person in cache[row.ImdbId].People ?? new List<string>())
+    {
+        var id = int.Parse(person.Split(':')[1]);
+        titlesByPerson.GetOrAdd(id, () => new List<string>()).Add(row.ImdbId);
+    }
+}
+var sharedPeople = titlesByPerson.Where(kv => kv.Value.Distinct().Count() > 1).Select(kv => kv.Key).ToHashSet();
+var peopleLinks = new Dictionary<string, List<string>>();
+var peopleNames = new Dictionary<string, string>();
+foreach (var row in peopleRows)
+{
+    var credits = (cache[row.ImdbId].People ?? new List<string>())
+        .Where(person => sharedPeople.Contains(int.Parse(person.Split(':')[1])))
+        .ToList();
+    if (credits.Count == 0) continue;
+    peopleLinks[row.ImdbId] = credits.Select(person => string.Join(':', person.Split(':').Take(2))).Distinct().ToList();
+    foreach (var person in credits)
+    {
+        var parts = person.Split(':', 3);
+        peopleNames[parts[1]] = parts[2];
+    }
+}
+Console.WriteLine($"  связи: {peopleLinks.Count:N0} титлов, {peopleNames.Count:N0} человек");
+
 // ---- in cinemas, not yet online ----------------------------------------------
 // A movie is "in cinemas" from its first theatrical release (any country)
 // for up to half a year, until a digital release appears anywhere. Checked
@@ -597,6 +662,11 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
     File.WriteAllText(latestPath, JsonSerializer.Serialize(latest, jsonOpts));
     Console.WriteLine($"  {Path.GetFileName(latestPath)}: {items.Skip(Math.Max(0, items.Count - 50)).Count():N0} записей");
 }
+
+// Who made what: "d:123" (director), "w:…" (writer), "c:…" (creator).
+File.WriteAllText(Path.Combine(docsDir, "data", "people.json"),
+    JsonSerializer.Serialize(new { names = peopleNames, links = peopleLinks }, jsonOpts));
+Console.WriteLine($"  people.json: {peopleLinks.Count} титлов");
 
 // Every movie in cinemas, for the app's own lists (not only the tops).
 File.WriteAllText(Path.Combine(docsDir, "data", "cinema.json"), JsonSerializer.Serialize(
@@ -937,6 +1007,55 @@ static async Task FetchSeasonsAsync(HttpClient client, TmdbEntry entry)
     entry.SeasonsCheckedAt = DateTime.UtcNow;
 }
 
+// "d:id:name" / "w:id:name" / "c:id:name". Movies: every director and
+// writer. Series: the creator, the director and the writer, each only when
+// alone in the role.
+static async Task<List<string>> FetchPeopleAsync(HttpClient client, string kind, int tmdbId)
+{
+    var people = new List<string>();
+    if (kind == "movie")
+    {
+        using var doc = JsonDocument.Parse(await client.GetStringAsync(
+            $"https://api.themoviedb.org/3/movie/{tmdbId}/credits?api_key={TmdbKey}"));
+        foreach (var crew in doc.RootElement.GetProperty("crew").EnumerateArray())
+        {
+            var job = crew.GetProperty("job").GetString();
+            var role = job == "Director" ? "d" : job is "Screenplay" or "Writer" ? "w" : null;
+            if (role != null)
+            {
+                people.Add($"{role}:{crew.GetProperty("id").GetInt32()}:{crew.GetProperty("name").GetString()}");
+            }
+        }
+        return people.Distinct().ToList();
+    }
+
+    using var tv = JsonDocument.Parse(await client.GetStringAsync(
+        $"https://api.themoviedb.org/3/tv/{tmdbId}?api_key={TmdbKey}&append_to_response=aggregate_credits"));
+    var root = tv.RootElement;
+    var creators = root.GetProperty("created_by").EnumerateArray().ToList();
+    if (creators.Count == 1)
+    {
+        people.Add($"c:{creators[0].GetProperty("id").GetInt32()}:{creators[0].GetProperty("name").GetString()}");
+    }
+    var directors = new List<JsonElement>();
+    var writers = new List<JsonElement>();
+    foreach (var crew in root.GetProperty("aggregate_credits").GetProperty("crew").EnumerateArray())
+    {
+        var jobs = crew.GetProperty("jobs").EnumerateArray().Select(j => j.GetProperty("job").GetString()).ToList();
+        if (jobs.Contains("Director")) directors.Add(crew);
+        if (jobs.Any(j => j is "Writer" or "Screenplay" or "Teleplay")) writers.Add(crew);
+    }
+    if (directors.Count == 1)
+    {
+        people.Add($"d:{directors[0].GetProperty("id").GetInt32()}:{directors[0].GetProperty("name").GetString()}");
+    }
+    if (writers.Count == 1)
+    {
+        people.Add($"w:{writers[0].GetProperty("id").GetInt32()}:{writers[0].GetProperty("name").GetString()}");
+    }
+    return people;
+}
+
 // The first theatrical and the first digital release of a movie, in any country.
 static async Task<CinemaEntry> FetchCinemaAsync(HttpClient client, int tmdbId)
 {
@@ -1117,6 +1236,8 @@ internal sealed class TmdbEntry
     public bool NotFound { get; set; }
     // Age ratings as "US:PG", "RU:6+", "DE:0"…; null = not fetched yet.
     public List<string>? Certifications { get; set; }
+    // Directors, writers, creators: "d:id:name" (FetchPeopleAsync); null = not fetched.
+    public List<string>? People { get; set; }
     // Series: the latest season on air (FetchSeasonsAsync).
     public DateTime? SeasonsCheckedAt { get; set; }
     public string? TvStatus { get; set; }
