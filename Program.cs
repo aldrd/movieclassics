@@ -438,6 +438,65 @@ bool CurrentSeason(TmdbEntry? e) =>
 Console.WriteLine($"  сезон за год: {selected["series"].Count(r => CurrentSeason(cache.GetValueOrDefault(r.ImdbId)))} " +
                   $"(продолжений: {selected["series"].Count(r => CurrentSeason(cache.GetValueOrDefault(r.ImdbId)) && cache[r.ImdbId].Season > 1)})");
 
+// ---- in cinemas, not yet online ----------------------------------------------
+// A movie is "in cinemas" from its first theatrical release (any country)
+// for up to half a year, until a digital release appears anywhere. Checked
+// daily for TMDB's "now playing" lists and the recent movie candidates; a
+// movie already online, or out for long, is not asked again.
+
+var cinemaCachePath = Path.Combine(cacheDir, "cinema-cache.json");
+var cinemaCache = File.Exists(cinemaCachePath)
+    ? JsonSerializer.Deserialize<Dictionary<int, CinemaEntry>>(File.ReadAllText(cinemaCachePath)) ?? new()
+    : new Dictionary<int, CinemaEntry>();
+var cinemaIds = new HashSet<int>();
+foreach (var region in new[] { "US", "RU", "GB", "DE", "KZ" })
+{
+    for (var page = 1; page <= 10; page++)
+    {
+        using var doc = JsonDocument.Parse(await http.GetStringAsync(
+            $"https://api.themoviedb.org/3/movie/now_playing?api_key={TmdbKey}&region={region}&page={page}"));
+        foreach (var movie in doc.RootElement.GetProperty("results").EnumerateArray())
+        {
+            cinemaIds.Add(movie.GetProperty("id").GetInt32());
+        }
+        if (page >= doc.RootElement.GetProperty("total_pages").GetInt32()) break;
+    }
+}
+Console.WriteLine($"Кино: {cinemaIds.Count} в прокате по TMDB");
+foreach (var row in candidates["movie"].Where(r => r.Year >= currentYear - 1))
+{
+    if (cache.TryGetValue(row.ImdbId, out var e) && e.TmdbId is { } id) cinemaIds.Add(id);
+}
+bool CinemaDue(CinemaEntry? c) =>
+    c == null ||
+    (c.DigitalDate is not { } digital || digital > today) &&
+    (c.TheatricalDate is not { } theatrical || theatrical > today.AddDays(-200)) &&
+    c.CheckedAt < DateTime.UtcNow.AddHours(-20);
+var cinemaWork = cinemaIds.Where(id => CinemaDue(cinemaCache.GetValueOrDefault(id))).ToList();
+Console.WriteLine($"  даты выхода: {cinemaWork.Count:N0} к проверке");
+await Task.WhenAll(cinemaWork.Select(async id =>
+{
+    await gate.WaitAsync();
+    try
+    {
+        var entry = await FetchCinemaAsync(http, id);
+        lock (cinemaCache) { cinemaCache[id] = entry; }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  ! кино {id}: {ex.Message}");
+    }
+    finally { gate.Release(); }
+}));
+File.WriteAllText(cinemaCachePath, JsonSerializer.Serialize(cinemaCache));
+var inCinema = cinemaCache.Values
+    .Where(c => c.ImdbId != null && c.TheatricalDate is { } theatrical &&
+                theatrical <= today && theatrical > today.AddDays(-180) &&
+                (c.DigitalDate is not { } digital || digital > today))
+    .ToList();
+var inCinemaIds = inCinema.Select(c => c.ImdbId!).ToHashSet();
+Console.WriteLine($"  в кино без цифрового релиза: {inCinema.Count}");
+
 // Kids top: 80% most voted, the rest highest rated of the remaining pool;
 // only titles the age rating confirms, with a RU description and a poster.
 var kidsSelected = new List<TitleRow>();
@@ -498,7 +557,8 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
             ["season"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.Season : null,
             ["seasonDate"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.SeasonDate : null,
             ["episodesAired"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.EpisodesAired : null,
-            ["episodesTotal"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.EpisodesTotal : null
+            ["episodesTotal"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.EpisodesTotal : null,
+            ["inCinema"] = kind != "series" && inCinemaIds.Contains(row.ImdbId) ? true : null
         });
     }
     var path = Path.Combine(docsDir, "data", fileName);
@@ -522,7 +582,8 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
         ["season"] = m["season"],
         ["seasonDate"] = m["seasonDate"],
         ["episodesAired"] = m["episodesAired"],
-        ["episodesTotal"] = m["episodesTotal"]
+        ["episodesTotal"] = m["episodesTotal"],
+        ["inCinema"] = m["inCinema"]
     }.Where(field => field.Value is not null).ToDictionary(field => field.Key, field => field.Value);
 
     var slimPath = Path.Combine(docsDir, "data", fileName.Replace(".json", "-slim.json"));
@@ -536,6 +597,11 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
     File.WriteAllText(latestPath, JsonSerializer.Serialize(latest, jsonOpts));
     Console.WriteLine($"  {Path.GetFileName(latestPath)}: {items.Skip(Math.Max(0, items.Count - 50)).Count():N0} записей");
 }
+
+// Every movie in cinemas, for the app's own lists (not only the tops).
+File.WriteAllText(Path.Combine(docsDir, "data", "cinema.json"), JsonSerializer.Serialize(
+    inCinema.OrderByDescending(c => c.TheatricalDate).Select(c => new { imdbId = c.ImdbId, title = c.Title }), jsonOpts));
+Console.WriteLine($"  cinema.json: {inCinema.Count} записей");
 
 // ---- Russian tops (Kinopoisk) ------------------------------------------------
 // The key lives in kp.key (not in git). The first run downloads every Russian
@@ -871,6 +937,44 @@ static async Task FetchSeasonsAsync(HttpClient client, TmdbEntry entry)
     entry.SeasonsCheckedAt = DateTime.UtcNow;
 }
 
+// The first theatrical and the first digital release of a movie, in any country.
+static async Task<CinemaEntry> FetchCinemaAsync(HttpClient client, int tmdbId)
+{
+    using var doc = JsonDocument.Parse(await client.GetStringAsync(
+        $"https://api.themoviedb.org/3/movie/{tmdbId}?api_key={TmdbKey}&append_to_response=release_dates,external_ids"));
+    var root = doc.RootElement;
+    var entry = new CinemaEntry
+    {
+        ImdbId = root.GetProperty("external_ids").TryGetProperty("imdb_id", out var imdb) && imdb.ValueKind == JsonValueKind.String
+            ? imdb.GetString()
+            : null,
+        Title = root.TryGetProperty("title", out var title) ? title.GetString() : null,
+        CheckedAt = DateTime.UtcNow
+    };
+    foreach (var country in root.GetProperty("release_dates").GetProperty("results").EnumerateArray())
+    {
+        foreach (var release in country.GetProperty("release_dates").EnumerateArray())
+        {
+            if (!DateTime.TryParse(release.GetProperty("release_date").GetString(), System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AdjustToUniversal, out var date))
+            {
+                continue;
+            }
+            date = date.Date;
+            switch (release.GetProperty("type").GetInt32())
+            {
+                case 2 or 3:
+                    if (entry.TheatricalDate is not { } t || date < t) entry.TheatricalDate = date;
+                    break;
+                case 4:
+                    if (entry.DigitalDate is not { } d || date < d) entry.DigitalDate = date;
+                    break;
+            }
+        }
+    }
+    return entry;
+}
+
 // Age ratings from TMDB for the countries whose systems say "for children".
 static async Task<List<string>> FetchCertificationsAsync(HttpClient client, TitleRow row, int tmdbId)
 {
@@ -1021,6 +1125,15 @@ internal sealed class TmdbEntry
     public string? SeasonDate { get; set; }
     public int? EpisodesAired { get; set; }
     public int? EpisodesTotal { get; set; }
+}
+
+internal sealed class CinemaEntry
+{
+    public string? ImdbId { get; set; }
+    public string? Title { get; set; }
+    public DateTime? TheatricalDate { get; set; }
+    public DateTime? DigitalDate { get; set; }
+    public DateTime CheckedAt { get; set; }
 }
 
 internal sealed class FindResponse
