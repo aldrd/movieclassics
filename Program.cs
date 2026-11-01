@@ -389,6 +389,55 @@ await Task.WhenAll(certWork.Select(async row =>
 SaveCache(cachePath, cache);
 Console.WriteLine($"\r  рейтинги {certDone}/{certWork.Count} готово   ");
 
+// ---- seasons of the series (daily; long-ended ones monthly) ------------------
+// A series whose latest season premiered within a year is shown again in the
+// app at that premiere, with the season and the episodes aired so far.
+
+var today = DateTime.UtcNow.Date;
+bool SeasonsDue(TmdbEntry e)
+{
+    if (e.SeasonsCheckedAt is not { } checkedAt) return true;
+    var ended = e.TvStatus is "Ended" or "Canceled" &&
+                DateTime.TryParse(e.LastAirDate, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var lastAir) &&
+                lastAir < today.AddDays(-400);
+    return checkedAt < DateTime.UtcNow - (ended ? TimeSpan.FromDays(30) : TimeSpan.FromHours(20));
+}
+var seasonWork = selected["series"]
+    .Where(r => cache.TryGetValue(r.ImdbId, out var e) && e.TmdbId != null && SeasonsDue(e))
+    .ToList();
+Console.WriteLine($"Сезоны: {seasonWork.Count:N0} к проверке");
+var seasonDone = 0;
+await Task.WhenAll(seasonWork.Select(async row =>
+{
+    await gate.WaitAsync();
+    try
+    {
+        await FetchSeasonsAsync(http, cache[row.ImdbId]);
+        if (Interlocked.Increment(ref seasonDone) % 500 == 0)
+        {
+            Console.Write($"\r  сезоны {seasonDone}/{seasonWork.Count}");
+            lock (saveLock) { SaveCache(cachePath, cache); }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n  ! {row.ImdbId} сезоны: {ex.Message}");
+    }
+    finally { gate.Release(); }
+}));
+SaveCache(cachePath, cache);
+Console.WriteLine($"\r  сезоны {seasonDone}/{seasonWork.Count} готово   ");
+
+// The season to show: premiered within a year and already on air.
+bool CurrentSeason(TmdbEntry? e) =>
+    e?.Season is > 0 && e.EpisodesAired is > 0 &&
+    DateTime.TryParse(e.SeasonDate, System.Globalization.CultureInfo.InvariantCulture,
+        System.Globalization.DateTimeStyles.None, out var premiere) &&
+    premiere <= today && premiere > today.AddDays(-365);
+Console.WriteLine($"  сезон за год: {selected["series"].Count(r => CurrentSeason(cache.GetValueOrDefault(r.ImdbId)))} " +
+                  $"(продолжений: {selected["series"].Count(r => CurrentSeason(cache.GetValueOrDefault(r.ImdbId)) && cache[r.ImdbId].Season > 1)})");
+
 // Kids top: 80% most voted, the rest highest rated of the remaining pool;
 // only titles the age rating confirms, with a RU description and a poster.
 var kidsSelected = new List<TitleRow>();
@@ -445,15 +494,20 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
             ["overviewEn"] = tmdb?.OverviewEn,
             ["overviewRu"] = tmdb?.OverviewRu,
             ["poster"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w500" + tmdb.PosterPath,
-            ["posterSmall"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w185" + tmdb.PosterPath
+            ["posterSmall"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w185" + tmdb.PosterPath,
+            ["season"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.Season : null,
+            ["seasonDate"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.SeasonDate : null,
+            ["episodesAired"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.EpisodesAired : null,
+            ["episodesTotal"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.EpisodesTotal : null
         });
     }
     var path = Path.Combine(docsDir, "data", fileName);
     File.WriteAllText(path, JsonSerializer.Serialize(items, jsonOpts));
     Console.WriteLine($"  {fileName}: {items.Count:N0} записей");
 
-    // App display shape: only the fields it shows.
-    static Dictionary<string, object?> ToAppShape(Dictionary<string, object?> m) => new()
+    // App display shape: only the fields it shows, empty ones left out
+    // (a dictionary ignores WhenWritingNull; most titles have no season).
+    static Dictionary<string, object?> ToAppShape(Dictionary<string, object?> m) => new Dictionary<string, object?>
     {
         ["imdbId"] = m["imdbId"],
         ["year"] = m["year"],
@@ -464,8 +518,12 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
         ["titleEn"] = m["titleEn"],
         ["titleRu"] = m["titleRu"],
         ["overviewRu"] = m["overviewRu"],
-        ["posterSmall"] = m["posterSmall"]
-    };
+        ["posterSmall"] = m["posterSmall"],
+        ["season"] = m["season"],
+        ["seasonDate"] = m["seasonDate"],
+        ["episodesAired"] = m["episodesAired"],
+        ["episodesTotal"] = m["episodesTotal"]
+    }.Where(field => field.Value is not null).ToDictionary(field => field.Key, field => field.Value);
 
     var slimPath = Path.Combine(docsDir, "data", fileName.Replace(".json", "-slim.json"));
     File.WriteAllText(slimPath, JsonSerializer.Serialize(items.Select(ToAppShape), jsonOpts));
@@ -776,6 +834,43 @@ static async Task FetchReleaseDateAsync(HttpClient client, TitleRow row, TmdbEnt
     entry.NoReleaseDate = string.IsNullOrWhiteSpace(entry.ReleaseDate);
 }
 
+// The latest season on air: its number and premiere, episodes aired / total.
+static async Task FetchSeasonsAsync(HttpClient client, TmdbEntry entry)
+{
+    using var doc = JsonDocument.Parse(await client.GetStringAsync(
+        $"https://api.themoviedb.org/3/tv/{entry.TmdbId}?api_key={TmdbKey}"));
+    var root = doc.RootElement;
+    static string? Text(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+    static int? Number(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : null;
+
+    entry.TvStatus = Text(root, "status");
+    entry.LastAirDate = Text(root, "last_air_date");
+    entry.Season = null;
+    entry.SeasonDate = null;
+    entry.EpisodesAired = null;
+    entry.EpisodesTotal = null;
+    if (root.TryGetProperty("last_episode_to_air", out var last) && last.ValueKind == JsonValueKind.Object &&
+        Number(last, "season_number") is > 0 and var season)
+    {
+        entry.Season = season;
+        entry.EpisodesAired = Number(last, "episode_number");
+        if (root.TryGetProperty("seasons", out var seasons) && seasons.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var s in seasons.EnumerateArray())
+            {
+                if (Number(s, "season_number") == season)
+                {
+                    entry.SeasonDate = Text(s, "air_date");
+                    entry.EpisodesTotal = Number(s, "episode_count");
+                }
+            }
+        }
+    }
+    entry.SeasonsCheckedAt = DateTime.UtcNow;
+}
+
 // Age ratings from TMDB for the countries whose systems say "for children".
 static async Task<List<string>> FetchCertificationsAsync(HttpClient client, TitleRow row, int tmdbId)
 {
@@ -918,6 +1013,14 @@ internal sealed class TmdbEntry
     public bool NotFound { get; set; }
     // Age ratings as "US:PG", "RU:6+", "DE:0"…; null = not fetched yet.
     public List<string>? Certifications { get; set; }
+    // Series: the latest season on air (FetchSeasonsAsync).
+    public DateTime? SeasonsCheckedAt { get; set; }
+    public string? TvStatus { get; set; }
+    public string? LastAirDate { get; set; }
+    public int? Season { get; set; }
+    public string? SeasonDate { get; set; }
+    public int? EpisodesAired { get; set; }
+    public int? EpisodesTotal { get; set; }
 }
 
 internal sealed class FindResponse
