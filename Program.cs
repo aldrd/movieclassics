@@ -668,6 +668,47 @@ File.WriteAllText(Path.Combine(docsDir, "data", "people.json"),
     JsonSerializer.Serialize(new { names = peopleNames, links = peopleLinks }, jsonOpts));
 Console.WriteLine($"  people.json: {peopleLinks.Count} титлов");
 
+// ---- news: what joined the tops, newest first --------------------------------
+// The day each title (and each new season, from the second on) first showed
+// up in the movie or series top is kept in cache/added-history.json. The
+// first run rebuilds it from the published history in git; titles that came
+// with an algorithm change are not news, unless they were fresh releases
+// (dated by their release then). news.json lists the last half year.
+
+const int NewsDays = 183;
+var historyPath = Path.Combine(cacheDir, "added-history.json");
+var added = File.Exists(historyPath)
+    ? JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(historyPath)) ?? new()
+    : RebuildAddedHistory(root);
+var todayText = today.ToString("yyyy-MM-dd");
+var currentKeys = new List<(string Key, string ImdbId, string Kind, int? Season)>();
+foreach (var kind in new[] { "movie", "series" })
+{
+    foreach (var row in selected[kind])
+    {
+        var prefix = kind == "movie" ? "m" : "s";
+        currentKeys.Add(($"{prefix}:{row.ImdbId}", row.ImdbId, kind, null));
+        if (kind == "series" && cache.TryGetValue(row.ImdbId, out var e) && CurrentSeason(e) && e.Season > 1)
+        {
+            currentKeys.Add(($"s:{row.ImdbId}:S{e.Season}", row.ImdbId, kind, e.Season));
+        }
+    }
+}
+var newToday = 0;
+foreach (var (key, _, _, _) in currentKeys)
+{
+    if (added.TryAdd(key, todayText)) newToday++;
+}
+File.WriteAllText(historyPath, JsonSerializer.Serialize(added));
+var newsFrom = today.AddDays(-NewsDays).ToString("yyyy-MM-dd");
+var news = currentKeys
+    .Where(k => added.TryGetValue(k.Key, out var at) && at != "base" && string.CompareOrdinal(at, newsFrom) >= 0)
+    .Select(k => new { imdbId = k.ImdbId, kind = k.Kind, season = k.Season, addedAt = added[k.Key] })
+    .OrderByDescending(n => n.addedAt, StringComparer.Ordinal)
+    .ToList();
+File.WriteAllText(Path.Combine(docsDir, "data", "news.json"), JsonSerializer.Serialize(news, jsonOpts));
+Console.WriteLine($"  news.json: {news.Count} записей ({newToday} новых сегодня)");
+
 // Every movie in cinemas, for the app's own lists (not only the tops).
 File.WriteAllText(Path.Combine(docsDir, "data", "cinema.json"), JsonSerializer.Serialize(
     inCinema.OrderByDescending(c => c.TheatricalDate).Select(c => new { imdbId = c.ImdbId, title = c.Title }), jsonOpts));
@@ -1054,6 +1095,74 @@ static async Task<List<string>> FetchPeopleAsync(HttpClient client, string kind,
         people.Add($"w:{writers[0].GetProperty("id").GetInt32()}:{writers[0].GetProperty("name").GetString()}");
     }
     return people;
+}
+
+// The added-history from the published data in git: the first commit with a
+// title (or season) dates it. A commit after a code change (or the first
+// one, or the first with seasons) is an algorithm change: what it brought
+// is not news ("base"), except fresh releases, dated by their release.
+static Dictionary<string, string> RebuildAddedHistory(string root)
+{
+    string Git(string arguments)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo("git", arguments)
+        {
+            WorkingDirectory = root,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            StandardOutputEncoding = System.Text.Encoding.UTF8
+        };
+        using var process = System.Diagnostics.Process.Start(info)!;
+        var output = process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+        return process.ExitCode == 0 ? output : string.Empty;
+    }
+
+    var history = new Dictionary<string, string>();
+    var codeChanged = false;
+    var firstData = true;
+    var seasonsSeen = false;
+    var commits = Git("log --reverse --format=@%H|%ad --date=short --name-only").Split('@', StringSplitOptions.RemoveEmptyEntries);
+    foreach (var block in commits)
+    {
+        var lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var head = lines[0].Split('|');
+        var (hash, date) = (head[0], DateTime.Parse(head[1], System.Globalization.CultureInfo.InvariantCulture));
+        var files = lines.Skip(1).ToList();
+        if (files.Contains("Program.cs")) codeChanged = true;
+        if (!files.Any(f => f is "docs/data/movies-slim.json" or "docs/data/series-slim.json")) continue;
+
+        var algorithmic = codeChanged || firstData;
+        codeChanged = false;
+        firstData = false;
+        var withSeasons = false;
+        foreach (var (file, prefix) in new[] { ("movies-slim.json", "m"), ("series-slim.json", "s") })
+        {
+            var json = Git($"show {hash}:docs/data/{file}");
+            if (json.Length == 0) continue;
+            using var doc = JsonDocument.Parse(json);
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                var id = item.GetProperty("imdbId").GetString()!;
+                string? Text(string name) => item.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+                string Dated(string? sinceText) =>
+                    DateTime.TryParse(sinceText, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var since) &&
+                    since <= date && since > date.AddDays(-NewsDays)
+                        ? since.ToString("yyyy-MM-dd")
+                        : "base";
+                history.TryAdd($"{prefix}:{id}", algorithmic ? Dated(Text("releaseDate")) : date.ToString("yyyy-MM-dd"));
+                if (prefix == "s" && item.TryGetProperty("season", out var season) && season.ValueKind == JsonValueKind.Number && season.GetInt32() > 1)
+                {
+                    withSeasons = true;
+                    history.TryAdd($"s:{id}:S{season.GetInt32()}",
+                        algorithmic || !seasonsSeen ? Dated(Text("seasonDate")) : date.ToString("yyyy-MM-dd"));
+                }
+            }
+        }
+        seasonsSeen |= withSeasons;
+    }
+    Console.WriteLine($"  история добавлений восстановлена из git: {history.Count} записей");
+    return history;
 }
 
 // The first theatrical and the first digital release of a movie, in any country.
