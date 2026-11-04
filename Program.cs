@@ -597,6 +597,153 @@ var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 };
 
 selected["kids"] = kidsSelected;
+
+// ---- creators: who made each title (the app's opened card) -------------------
+// For every title of the tops: its director and writer, and for a series its
+// creator (showrunner); of several people in one role the one whose best
+// known other title has the most votes, named with that title. Candidates
+// (the most popular few per role) are cached per title, the people's works
+// per person (cache/tmdb-persons.json): only new titles and people are
+// asked. creators.json holds person ids per title, names and works once each.
+
+const int CreatorCandidates = 4;
+const int PersonRefreshDays = 120;
+var creatorRows = selected["movie"].Concat(selected["series"]).Concat(kidsSelected)
+    .Where(r => cache.TryGetValue(r.ImdbId, out var e) && e.TmdbId != null)
+    .DistinctBy(r => r.ImdbId)
+    .ToList();
+var crewWork = creatorRows.Where(r => cache[r.ImdbId].Crew == null).ToList();
+Console.WriteLine($"Авторы: {crewWork.Count:N0} титлов к загрузке из {creatorRows.Count:N0}");
+var crewDone = 0;
+await Task.WhenAll(crewWork.Select(async row =>
+{
+    await gate.WaitAsync();
+    try
+    {
+        var entry = cache[row.ImdbId];
+        entry.Crew = await FetchCrewAsync(http, row.Kind, entry.TmdbId!.Value, CreatorCandidates);
+        if (Interlocked.Increment(ref crewDone) % 500 == 0)
+        {
+            Console.Write($"\r  авторы {crewDone}/{crewWork.Count}");
+            lock (saveLock) { SaveCache(cachePath, cache); }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n  ! {row.ImdbId} авторы: {ex.Message}");
+    }
+    finally { gate.Release(); }
+}));
+SaveCache(cachePath, cache);
+Console.WriteLine($"\r  авторы {crewDone}/{crewWork.Count} готово   ");
+
+var personsPath = Path.Combine(cacheDir, "tmdb-persons.json");
+var persons = File.Exists(personsPath)
+    ? JsonSerializer.Deserialize<Dictionary<int, PersonEntry>>(File.ReadAllText(personsPath), cacheJsonOpts) ?? new()
+    : new Dictionary<int, PersonEntry>();
+var personIds = creatorRows.SelectMany(r => cache[r.ImdbId].Crew ?? new List<string>())
+    .Select(c => int.Parse(c.Split(':')[1]))
+    .ToHashSet();
+var newPersons = personIds.Count(id => !persons.ContainsKey(id));
+var personWork = personIds
+    .Where(id => !persons.TryGetValue(id, out var p) || p.CheckedAt < DateTime.UtcNow.AddDays(-PersonRefreshDays))
+    // New people first, then the longest unchecked; a few thousand a run.
+    .OrderBy(id => persons.TryGetValue(id, out var p) ? p.CheckedAt : DateTime.MinValue)
+    .Take(Math.Max(3000, newPersons))
+    .ToList();
+Console.WriteLine($"  люди: {personWork.Count:N0} к загрузке из {personIds.Count:N0}");
+var personDone = 0;
+var personLock = new object();
+void SavePersons()
+{
+    var tmp = personsPath + ".tmp";
+    File.WriteAllText(tmp, JsonSerializer.Serialize(persons, cacheJsonOpts));
+    File.Move(tmp, personsPath, overwrite: true);
+}
+await Task.WhenAll(personWork.Select(async id =>
+{
+    await gate.WaitAsync();
+    try
+    {
+        var person = await FetchPersonAsync(http, id);
+        lock (personLock)
+        {
+            persons[id] = person;
+            if (++personDone % 500 == 0)
+            {
+                Console.Write($"\r  люди {personDone}/{personWork.Count}");
+                SavePersons();
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n  ! человек {id}: {ex.Message}");
+    }
+    finally { gate.Release(); }
+}));
+SavePersons();
+Console.WriteLine($"\r  люди {personDone}/{personWork.Count} готово   ");
+
+// Works: "Тёмный рыцарь|The Dark Knight" (the original title only when it
+// differs); names: "Кристофер Нолан|Christopher Nolan" (the same way).
+var creatorWorks = new List<string>();
+var creatorWorkIndex = new Dictionary<string, int>();
+var creatorNames = new Dictionary<string, string>();
+var creatorTitles = new Dictionary<string, List<string>>();
+static string Pair(string ru, string? other) =>
+    string.IsNullOrWhiteSpace(other) || other == ru ? ru : $"{ru}|{other}";
+foreach (var row in creatorRows)
+{
+    var entry = cache[row.ImdbId];
+    var media = row.Kind == "series" ? "tv" : "movie";
+    var byRole = (entry.Crew ?? new List<string>())
+        .Select(c => c.Split(':', 4))
+        .GroupBy(p => p[0][0])
+        .ToDictionary(g => g.Key, g => g.Select(p => (
+            Id: int.Parse(p[1]),
+            Popularity: double.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture),
+            NameEn: p[3])).ToList());
+    var chosen = new List<(char Role, int Id, string NameEn, PersonWork? Work)>();
+    foreach (var role in new[] { 'c', 'd', 'w' })
+    {
+        if (!byRole.TryGetValue(role, out var people)) continue;
+        var best = people
+            .Select(p => (Person: p, Work: persons.GetValueOrDefault(p.Id)?.Works
+                .Where(w => w.Department == PersonEntry.Department(role) && !(w.Media == media && w.TmdbId == entry.TmdbId))
+                .MaxBy(w => w.Votes)))
+            .OrderByDescending(p => p.Work?.Votes ?? -1)
+            .ThenByDescending(p => p.Person.Popularity)
+            .First();
+        chosen.Add((role, best.Person.Id, best.Person.NameEn, best.Work));
+    }
+    if (chosen.Count == 0) continue;
+    var credits = new List<string>();
+    foreach (var group in chosen.GroupBy(c => c.Id))
+    {
+        var first = group.First();
+        var nameRu = persons.GetValueOrDefault(first.Id)?.NameRu;
+        creatorNames[first.Id.ToString()] = Pair(string.IsNullOrWhiteSpace(nameRu) ? first.NameEn : nameRu, first.NameEn);
+        var credit = $"{string.Concat(group.Select(c => c.Role))}:{first.Id}";
+        if (group.Select(c => c.Work).FirstOrDefault(w => w != null) is { } bestWork)
+        {
+            var text = Pair(bestWork.TitleRu, bestWork.TitleOriginal);
+            if (!creatorWorkIndex.TryGetValue(text, out var index))
+            {
+                creatorWorkIndex[text] = index = creatorWorks.Count;
+                creatorWorks.Add(text);
+            }
+            credit += $":{index}";
+        }
+        credits.Add(credit);
+    }
+    creatorTitles[row.ImdbId] = credits;
+}
+// "dw:525:17": roles (c creator, d director, w writer), person id, work index.
+File.WriteAllText(Path.Combine(docsDir, "data", "creators.json"),
+    JsonSerializer.Serialize(new { names = creatorNames, works = creatorWorks, titles = creatorTitles }, jsonOpts));
+Console.WriteLine($"  creators.json: {creatorTitles.Count:N0} титлов, {creatorNames.Count:N0} человек, {creatorWorks.Count:N0} работ");
+
 foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "series.json"), ("kids", "kids-movies.json") })
 {
     var items = new List<Dictionary<string, object?>>();
@@ -1048,6 +1195,89 @@ static async Task FetchSeasonsAsync(HttpClient client, TmdbEntry entry)
     entry.SeasonsCheckedAt = DateTime.UtcNow;
 }
 
+// Creator candidates: "role:id:popularity:name", the most popular few per
+// role. Movies: directors ('d') and writers ('w'); series also creators
+// ('c'). Names in English (TMDB's default).
+static async Task<List<string>> FetchCrewAsync(HttpClient client, string kind, int tmdbId, int perRole)
+{
+    var found = new List<(char Role, int Id, double Popularity, string Name)>();
+    void Add(char role, JsonElement person)
+    {
+        var id = person.GetProperty("id").GetInt32();
+        if (found.Any(p => p.Role == role && p.Id == id)) return;
+        found.Add((role, id,
+            person.TryGetProperty("popularity", out var pop) && pop.ValueKind == JsonValueKind.Number ? pop.GetDouble() : 0,
+            person.GetProperty("name").GetString() ?? string.Empty));
+    }
+    if (kind == "series")
+    {
+        using var tv = JsonDocument.Parse(await client.GetStringAsync(
+            $"https://api.themoviedb.org/3/tv/{tmdbId}?api_key={TmdbKey}&append_to_response=aggregate_credits"));
+        foreach (var creator in tv.RootElement.GetProperty("created_by").EnumerateArray()) Add('c', creator);
+        foreach (var crew in tv.RootElement.GetProperty("aggregate_credits").GetProperty("crew").EnumerateArray())
+        {
+            var jobs = crew.GetProperty("jobs").EnumerateArray().Select(j => j.GetProperty("job").GetString()).ToList();
+            if (jobs.Contains("Director")) Add('d', crew);
+            if (jobs.Any(j => j is "Writer" or "Screenplay" or "Teleplay")) Add('w', crew);
+        }
+    }
+    else
+    {
+        using var doc = JsonDocument.Parse(await client.GetStringAsync(
+            $"https://api.themoviedb.org/3/movie/{tmdbId}/credits?api_key={TmdbKey}"));
+        foreach (var crew in doc.RootElement.GetProperty("crew").EnumerateArray())
+        {
+            var job = crew.GetProperty("job").GetString();
+            if (job == "Director") Add('d', crew);
+            else if (job is "Screenplay" or "Writer") Add('w', crew);
+        }
+    }
+    return found.GroupBy(p => p.Role)
+        .SelectMany(g => g.OrderByDescending(p => p.Popularity).Take(perRole))
+        .Select(p => $"{p.Role}:{p.Id}:{p.Popularity.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}:{p.Name}")
+        .ToList();
+}
+
+// A person's Russian name and best known works: per department the three
+// with the most votes (a title's own entry is skipped when picking).
+static async Task<PersonEntry> FetchPersonAsync(HttpClient client, int id)
+{
+    using var doc = JsonDocument.Parse(await client.GetStringAsync(
+        $"https://api.themoviedb.org/3/person/{id}?api_key={TmdbKey}&language=ru&append_to_response=combined_credits"));
+    var root = doc.RootElement;
+    var works = new List<PersonWork>();
+    foreach (var credit in root.GetProperty("combined_credits").GetProperty("crew").EnumerateArray())
+    {
+        var department = credit.TryGetProperty("department", out var d) ? d.GetString() : null;
+        if (department is not ("Directing" or "Writing" or "Creator")) continue;
+        var votes = credit.TryGetProperty("vote_count", out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : 0;
+        var title = (credit.TryGetProperty("title", out var t) ? t.GetString() : null)
+                    ?? (credit.TryGetProperty("name", out var n) ? n.GetString() : null);
+        var original = (credit.TryGetProperty("original_title", out var ot) ? ot.GetString() : null)
+                       ?? (credit.TryGetProperty("original_name", out var on) ? on.GetString() : null);
+        if (votes <= 0 || string.IsNullOrWhiteSpace(title)) continue;
+        works.Add(new PersonWork
+        {
+            Department = department,
+            Media = credit.GetProperty("media_type").GetString() ?? "movie",
+            TmdbId = credit.GetProperty("id").GetInt32(),
+            Votes = votes,
+            TitleRu = title,
+            TitleOriginal = original == title ? null : original
+        });
+    }
+    return new PersonEntry
+    {
+        NameRu = root.TryGetProperty("name", out var name) ? name.GetString() : null,
+        CheckedAt = DateTime.UtcNow,
+        // Three per department: one may be the title itself.
+        Works = works.DistinctBy(w => (w.Department, w.Media, w.TmdbId))
+            .GroupBy(w => w.Department)
+            .SelectMany(g => g.OrderByDescending(w => w.Votes).Take(3))
+            .ToList()
+    };
+}
+
 // "d:id:name" / "w:id:name" / "c:id:name". Movies: every director and
 // writer. Series: the creator, the director and the writer, each only when
 // alone in the role.
@@ -1347,6 +1577,8 @@ internal sealed class TmdbEntry
     public List<string>? Certifications { get; set; }
     // Directors, writers, creators: "d:id:name" (FetchPeopleAsync); null = not fetched.
     public List<string>? People { get; set; }
+    // Creator candidates: "role:id:popularity:name" (FetchCrewAsync); null = not fetched.
+    public List<string>? Crew { get; set; }
     // Series: the latest season on air (FetchSeasonsAsync).
     public DateTime? SeasonsCheckedAt { get; set; }
     public string? TvStatus { get; set; }
@@ -1355,6 +1587,31 @@ internal sealed class TmdbEntry
     public string? SeasonDate { get; set; }
     public int? EpisodesAired { get; set; }
     public int? EpisodesTotal { get; set; }
+}
+
+internal sealed class PersonEntry
+{
+    public string? NameRu { get; set; }
+    public DateTime CheckedAt { get; set; }
+    public List<PersonWork> Works { get; set; } = new();
+
+    // The department whose works name a person in that role.
+    public static string Department(char role) => role switch
+    {
+        'd' => "Directing",
+        'w' => "Writing",
+        _ => "Creator"
+    };
+}
+
+internal sealed class PersonWork
+{
+    public string Department { get; set; } = string.Empty;
+    public string Media { get; set; } = string.Empty;
+    public int TmdbId { get; set; }
+    public int Votes { get; set; }
+    public string TitleRu { get; set; } = string.Empty;
+    public string? TitleOriginal { get; set; }
 }
 
 internal sealed class CinemaEntry
