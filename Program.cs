@@ -766,10 +766,12 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
             ["overviewRu"] = tmdb?.OverviewRu,
             ["poster"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w500" + tmdb.PosterPath,
             ["posterSmall"] = tmdb?.PosterPath is null ? null : "https://image.tmdb.org/t/p/w185" + tmdb.PosterPath,
-            ["season"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.Season : null,
+            // Every series has its latest season; the premiere only within a
+            // year (the app shows the series again there).
+            ["season"] = kind == "series" && tmdb?.Season > 0 ? tmdb.Season : null,
             ["seasonDate"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.SeasonDate : null,
-            ["episodesAired"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.EpisodesAired : null,
-            ["episodesTotal"] = kind == "series" && CurrentSeason(tmdb) ? tmdb!.EpisodesTotal : null,
+            ["episodesAired"] = kind == "series" && tmdb?.Season > 0 ? tmdb.EpisodesAired : null,
+            ["episodesTotal"] = kind == "series" && tmdb?.Season > 0 ? tmdb.EpisodesTotal : null,
             ["inCinema"] = kind != "series" && inCinemaIds.Contains(row.ImdbId) ? true : null
         });
     }
@@ -1381,7 +1383,7 @@ static Dictionary<string, string> RebuildAddedHistory(string root)
                         ? since.ToString("yyyy-MM-dd")
                         : "base";
                 history.TryAdd($"{prefix}:{id}", algorithmic ? Dated(Text("releaseDate")) : date.ToString("yyyy-MM-dd"));
-                if (prefix == "s" && item.TryGetProperty("season", out var season) && season.ValueKind == JsonValueKind.Number && season.GetInt32() > 1)
+                if (prefix == "s" && Text("seasonDate") != null && item.TryGetProperty("season", out var season) && season.ValueKind == JsonValueKind.Number && season.GetInt32() > 1)
                 {
                     withSeasons = true;
                     history.TryAdd($"s:{id}:S{season.GetInt32()}",
