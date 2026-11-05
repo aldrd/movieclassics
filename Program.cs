@@ -52,6 +52,11 @@ const int RuSeriesYearQuota = 10;
 const int RuPoolPerYear = 100;
 const int RuMinVotes = 1000;        // past years
 const int RuMinVotesCurrent = 100;  // the current year is still gathering votes
+// The yearly quota leaves no room for new Russian releases (a year's hits
+// take it): one out less than five months, rated above 7 by enough people,
+// joins its year's top on top of the quota — a few series a month.
+const int RuFreshMinVotes = 1000;
+const double RuFreshMinRating = 7.0;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -817,6 +822,123 @@ File.WriteAllText(Path.Combine(docsDir, "data", "people.json"),
     JsonSerializer.Serialize(new { names = peopleNames, links = peopleLinks }, jsonOpts));
 Console.WriteLine($"  people.json: {peopleLinks.Count} титлов");
 
+// Every movie in cinemas, for the app's own lists (not only the tops).
+File.WriteAllText(Path.Combine(docsDir, "data", "cinema.json"), JsonSerializer.Serialize(
+    inCinema.OrderByDescending(c => c.TheatricalDate).Select(c => new { imdbId = c.ImdbId, title = c.Title }), jsonOpts));
+Console.WriteLine($"  cinema.json: {inCinema.Count} записей");
+
+// ---- Russian tops (Kinopoisk) ------------------------------------------------
+// The key lives in kp.key (not in git). The first run downloads every Russian
+// title with enough votes (a few dozen requests); later runs refresh only the
+// current year. Requests go slowly, one at a time.
+
+var kpKeyPath = Path.Combine(root, "kp.key");
+var ruCounts = new Dictionary<string, int>();
+var ruTops = new Dictionary<string, List<KpTitle>>();
+if (File.Exists(kpKeyPath) && !smoke)
+{
+    var kpKey = File.ReadAllText(kpKeyPath).Trim();
+    var kpDir = Path.Combine(cacheDir, "kp");
+    Directory.CreateDirectory(kpDir);
+    foreach (var (kind, types, quota, fileName) in new[]
+             {
+                 ("movie", new[] { "movie", "cartoon" }, RuMovieYearQuota, "ru-movies.json"),
+                 ("series", new[] { "tv-series", "animated-series" }, RuSeriesYearQuota, "ru-series.json")
+             })
+    {
+        var kpCachePath = Path.Combine(kpDir, $"{kind}.json");
+        var known = File.Exists(kpCachePath)
+            ? JsonSerializer.Deserialize<Dictionary<int, KpTitle>>(File.ReadAllText(kpCachePath)) ?? new()
+            : new Dictionary<int, KpTitle>();
+        var fresh = new List<KpTitle>();
+        try
+        {
+            // Everything once (year ranges small enough for the free tier's
+            // 10 pages), then the current year every day (and the last one
+            // in January–March).
+            var fullMark = Path.Combine(kpDir, $"{kind}.full");
+            if (!File.Exists(fullMark))
+            {
+                await FetchKpRangeAsync(kpKey, types, 1900, currentYear, RuMinVotes, fresh);
+                File.WriteAllText(fullMark, DateTime.UtcNow.ToString("o")); // reached only without errors
+            }
+            else
+            {
+                // Until April last year's titles are still gathering votes too.
+                var fromYear = today.Month <= 3 ? currentYear - 1 : currentYear;
+                await FetchKpRangeAsync(kpKey, types, fromYear, currentYear, RuMinVotesCurrent, fresh);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ! КП {kind}: {ex.Message}");
+        }
+        // What arrived is kept, also after a failure.
+        foreach (var title in fresh)
+        {
+            known[title.Id] = title;
+        }
+        File.WriteAllText(kpCachePath, JsonSerializer.Serialize(known));
+        Console.WriteLine($"  КП {kind}: {fresh.Count:N0} загружено, {known.Count:N0} в кэше");
+
+        // Per year: 80% most voted, the rest highest rated of the year's
+        // most voted; only with a description and a poster, rated 5+.
+        var ruSelected = new List<KpTitle>();
+        var ruFreshCount = 0;
+        foreach (var yearGroup in known.Values.Where(t => t.Year >= 1900 && t.Year <= currentYear).GroupBy(t => t.Year).OrderBy(g => g.Key))
+        {
+            var quotaY = YearQuota(quota, yearGroup.Key);
+            var votesQuota = (int)Math.Round(quotaY * 0.8);
+            var pool = yearGroup
+                .Where(t => t.Rating >= MinRating && !string.IsNullOrWhiteSpace(t.Description) && t.Poster != null)
+                .OrderByDescending(t => t.Votes)
+                .Take(RuPoolPerYear)
+                .ToList();
+            var votesPart = pool.Take(votesQuota).ToList();
+            var ratingPart = pool.Skip(votesQuota).OrderByDescending(t => t.Rating).ThenByDescending(t => t.Votes)
+                .Take(quotaY - votesPart.Count).ToList();
+            var freshPart = yearGroup.Except(votesPart).Except(ratingPart)
+                .Where(t => Math.Round(t.Rating, 1) > RuFreshMinRating && t.Votes >= RuFreshMinVotes &&
+                            !string.IsNullOrWhiteSpace(t.Description) && t.Poster != null &&
+                            DateTime.TryParse(t.ReleaseDate, System.Globalization.CultureInfo.InvariantCulture,
+                                System.Globalization.DateTimeStyles.None, out var released) &&
+                            released <= today && released >= today.AddDays(-FreshDays))
+                .ToList();
+            ruFreshCount += freshPart.Count;
+            ruSelected.AddRange(votesPart.Concat(ratingPart).Concat(freshPart)
+                .OrderBy(t => t.ReleaseDate ?? "9999-99-99")
+                .ThenByDescending(t => t.Votes));
+        }
+        ruCounts[kind] = ruSelected.Count;
+        ruTops[kind] = ruSelected;
+
+        // The app's shape; titles without an IMDb id are keyed "kp<id>".
+        var ruItems = ruSelected.Select(t => new Dictionary<string, object?>
+        {
+            ["imdbId"] = t.ImdbId ?? $"kp{t.Id}",
+            ["kpId"] = t.Id,
+            ["year"] = t.Year,
+            ["releaseDate"] = t.ReleaseDate,
+            ["rating"] = Math.Round(t.Rating, 1),
+            ["kpRating"] = Math.Round(t.Rating, 1),
+            ["votes"] = t.Votes,
+            ["titleOriginal"] = t.TitleOriginal,
+            ["titleEn"] = t.TitleEn,
+            ["titleRu"] = t.TitleRu,
+            ["overviewRu"] = t.Description,
+            ["posterSmall"] = t.Poster
+        }).ToList();
+        File.WriteAllText(Path.Combine(docsDir, "data", fileName.Replace(".json", "-slim.json")), JsonSerializer.Serialize(ruItems, jsonOpts));
+        File.WriteAllText(Path.Combine(docsDir, "data", fileName.Replace(".json", "-latest.json")),
+            JsonSerializer.Serialize(ruItems.Skip(Math.Max(0, ruItems.Count - 50)), jsonOpts));
+        Console.WriteLine($"  {fileName.Replace(".json", "-slim.json")}: {ruItems.Count:N0} записей ({ruFreshCount} новинок)");
+    }
+}
+else
+{
+    Console.WriteLine("КП: нет kp.key — российские топы не обновляются");
+}
+
 // ---- news: what joined the tops, newest first --------------------------------
 // The day each title (and each new season, from the second on) first showed
 // up in the movie or series top is kept in cache/added-history.json. The
@@ -843,123 +965,45 @@ foreach (var kind in new[] { "movie", "series" })
         }
     }
 }
+// The Russian tops (keyed like the app: IMDb id or "kp<id>"). The run that
+// first adds them takes what is there as the base; only fresh releases are
+// news then, dated by their premiere.
+var ruBootstrap = ruTops.Count > 0 && !added.ContainsKey("ru:since");
+foreach (var (kind, titles) in ruTops)
+{
+    foreach (var t in titles)
+    {
+        var id = t.ImdbId ?? $"kp{t.Id}";
+        var key = $"{(kind == "movie" ? "m" : "s")}:{id}";
+        if (ruBootstrap)
+        {
+            var fresh = DateTime.TryParse(t.ReleaseDate, System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None, out var released) &&
+                        released <= today && released >= today.AddDays(-NewsDays);
+            added.TryAdd(key, fresh ? released.ToString("yyyy-MM-dd") : "base");
+        }
+        currentKeys.Add((key, id, kind, null));
+    }
+}
+if (ruBootstrap)
+{
+    added["ru:since"] = "base";
+}
 var newToday = 0;
-foreach (var (key, _, _, _) in currentKeys)
+foreach (var (key, _, _, _) in currentKeys.DistinctBy(k => k.Key))
 {
     if (added.TryAdd(key, todayText)) newToday++;
 }
 File.WriteAllText(historyPath, JsonSerializer.Serialize(added));
 var newsFrom = today.AddDays(-NewsDays).ToString("yyyy-MM-dd");
 var news = currentKeys
+    .DistinctBy(k => k.Key)
     .Where(k => added.TryGetValue(k.Key, out var at) && at != "base" && string.CompareOrdinal(at, newsFrom) >= 0)
     .Select(k => new { imdbId = k.ImdbId, kind = k.Kind, season = k.Season, addedAt = added[k.Key] })
     .OrderByDescending(n => n.addedAt, StringComparer.Ordinal)
     .ToList();
 File.WriteAllText(Path.Combine(docsDir, "data", "news.json"), JsonSerializer.Serialize(news, jsonOpts));
 Console.WriteLine($"  news.json: {news.Count} записей ({newToday} новых сегодня)");
-
-// Every movie in cinemas, for the app's own lists (not only the tops).
-File.WriteAllText(Path.Combine(docsDir, "data", "cinema.json"), JsonSerializer.Serialize(
-    inCinema.OrderByDescending(c => c.TheatricalDate).Select(c => new { imdbId = c.ImdbId, title = c.Title }), jsonOpts));
-Console.WriteLine($"  cinema.json: {inCinema.Count} записей");
-
-// ---- Russian tops (Kinopoisk) ------------------------------------------------
-// The key lives in kp.key (not in git). The first run downloads every Russian
-// title with enough votes (a few dozen requests); later runs refresh only the
-// current year. Requests go slowly, one at a time.
-
-var kpKeyPath = Path.Combine(root, "kp.key");
-var ruCounts = new Dictionary<string, int>();
-if (File.Exists(kpKeyPath) && !smoke)
-{
-    var kpKey = File.ReadAllText(kpKeyPath).Trim();
-    var kpDir = Path.Combine(cacheDir, "kp");
-    Directory.CreateDirectory(kpDir);
-    foreach (var (kind, types, quota, fileName) in new[]
-             {
-                 ("movie", new[] { "movie", "cartoon" }, RuMovieYearQuota, "ru-movies.json"),
-                 ("series", new[] { "tv-series", "animated-series" }, RuSeriesYearQuota, "ru-series.json")
-             })
-    {
-        var kpCachePath = Path.Combine(kpDir, $"{kind}.json");
-        var known = File.Exists(kpCachePath)
-            ? JsonSerializer.Deserialize<Dictionary<int, KpTitle>>(File.ReadAllText(kpCachePath)) ?? new()
-            : new Dictionary<int, KpTitle>();
-        var fresh = new List<KpTitle>();
-        try
-        {
-            // Everything once (year ranges small enough for the free tier's
-            // 10 pages), then the current year every day.
-            var fullMark = Path.Combine(kpDir, $"{kind}.full");
-            if (!File.Exists(fullMark))
-            {
-                await FetchKpRangeAsync(kpKey, types, 1900, currentYear, RuMinVotes, fresh);
-                File.WriteAllText(fullMark, DateTime.UtcNow.ToString("o")); // reached only without errors
-            }
-            else
-            {
-                await FetchKpRangeAsync(kpKey, types, currentYear, currentYear, RuMinVotesCurrent, fresh);
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  ! КП {kind}: {ex.Message}");
-        }
-        // What arrived is kept, also after a failure.
-        foreach (var title in fresh)
-        {
-            known[title.Id] = title;
-        }
-        File.WriteAllText(kpCachePath, JsonSerializer.Serialize(known));
-        Console.WriteLine($"  КП {kind}: {fresh.Count:N0} загружено, {known.Count:N0} в кэше");
-
-        // Per year: 80% most voted, the rest highest rated of the year's
-        // most voted; only with a description and a poster, rated 5+.
-        var ruSelected = new List<KpTitle>();
-        foreach (var yearGroup in known.Values.Where(t => t.Year >= 1900 && t.Year <= currentYear).GroupBy(t => t.Year).OrderBy(g => g.Key))
-        {
-            var quotaY = YearQuota(quota, yearGroup.Key);
-            var votesQuota = (int)Math.Round(quotaY * 0.8);
-            var pool = yearGroup
-                .Where(t => t.Rating >= MinRating && !string.IsNullOrWhiteSpace(t.Description) && t.Poster != null)
-                .OrderByDescending(t => t.Votes)
-                .Take(RuPoolPerYear)
-                .ToList();
-            var votesPart = pool.Take(votesQuota).ToList();
-            var ratingPart = pool.Skip(votesQuota).OrderByDescending(t => t.Rating).ThenByDescending(t => t.Votes)
-                .Take(quotaY - votesPart.Count).ToList();
-            ruSelected.AddRange(votesPart.Concat(ratingPart)
-                .OrderBy(t => t.ReleaseDate ?? "9999-99-99")
-                .ThenByDescending(t => t.Votes));
-        }
-        ruCounts[kind] = ruSelected.Count;
-
-        // The app's shape; titles without an IMDb id are keyed "kp<id>".
-        var ruItems = ruSelected.Select(t => new Dictionary<string, object?>
-        {
-            ["imdbId"] = t.ImdbId ?? $"kp{t.Id}",
-            ["kpId"] = t.Id,
-            ["year"] = t.Year,
-            ["releaseDate"] = t.ReleaseDate,
-            ["rating"] = Math.Round(t.Rating, 1),
-            ["kpRating"] = Math.Round(t.Rating, 1),
-            ["votes"] = t.Votes,
-            ["titleOriginal"] = t.TitleOriginal,
-            ["titleEn"] = t.TitleEn,
-            ["titleRu"] = t.TitleRu,
-            ["overviewRu"] = t.Description,
-            ["posterSmall"] = t.Poster
-        }).ToList();
-        File.WriteAllText(Path.Combine(docsDir, "data", fileName.Replace(".json", "-slim.json")), JsonSerializer.Serialize(ruItems, jsonOpts));
-        File.WriteAllText(Path.Combine(docsDir, "data", fileName.Replace(".json", "-latest.json")),
-            JsonSerializer.Serialize(ruItems.Skip(Math.Max(0, ruItems.Count - 50)), jsonOpts));
-        Console.WriteLine($"  {fileName.Replace(".json", "-slim.json")}: {ruItems.Count:N0} записей");
-    }
-}
-else
-{
-    Console.WriteLine("КП: нет kp.key — российские топы не обновляются");
-}
 
 // Russian titles of these years: the free tier serves only 10 pages of a
 // query, so a range that has more is split in two. Whatever arrived before a
