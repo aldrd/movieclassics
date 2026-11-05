@@ -58,11 +58,14 @@ const int RuMinVotesCurrent = 100;  // the current year is still gathering votes
 const int RuFreshMinVotes = 1000;
 const double RuFreshMinRating = 7.0;
 // Russian series: the year's ten as above, then the new releases, then
-// every notable one (rated 7+ by 10 000+ people, most voted first) up to
-// thirty a year.
-const int RuSeriesYearMax = 30;
+// the notable ones (rated 7+ by 10 000+ people, most voted first) and the
+// rest by votes up to thirty a year at least. A series rated above 7 by
+// more than 50 000 people is always in, past the thirty.
+const int RuSeriesYearMin = 30;
 const int RuNotableMinVotes = 10000;
 const double RuNotableMinRating = 7.0;
+const int RuMustMinVotes = 50000;
+const double RuMustMinRating = 7.0;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -913,14 +916,18 @@ if (File.Exists(kpKeyPath) && !smoke)
             var chosen = votesPart.Concat(ratingPart).ToList();
             if (kind == "series")
             {
-                var cap = RuSeriesYearMax;
-                freshPart = freshPart.OrderByDescending(t => t.Rating).Take(Math.Max(0, cap - chosen.Count)).ToList();
+                bool Shown(KpTitle t) => !string.IsNullOrWhiteSpace(t.Description) && t.Poster != null;
                 chosen.AddRange(freshPart);
                 chosen.AddRange(yearGroup.Except(chosen)
-                    .Where(t => Math.Round(t.Rating, 1) >= RuNotableMinRating && t.Votes >= RuNotableMinVotes &&
-                                !string.IsNullOrWhiteSpace(t.Description) && t.Poster != null)
+                    .Where(t => Math.Round(t.Rating, 1) >= RuNotableMinRating && t.Votes >= RuNotableMinVotes && Shown(t))
                     .OrderByDescending(t => t.Votes)
-                    .Take(Math.Max(0, cap - chosen.Count)));
+                    .Take(Math.Max(0, RuSeriesYearMin - chosen.Count)));
+                chosen.AddRange(yearGroup.Except(chosen)
+                    .Where(t => t.Rating >= MinRating && Shown(t))
+                    .OrderByDescending(t => t.Votes)
+                    .Take(Math.Max(0, RuSeriesYearMin - chosen.Count)));
+                chosen.AddRange(yearGroup.Except(chosen)
+                    .Where(t => Math.Round(t.Rating, 1) > RuMustMinRating && t.Votes > RuMustMinVotes && Shown(t)));
             }
             else
             {
@@ -991,7 +998,7 @@ foreach (var kind in new[] { "movie", "series" })
 // first adds them — or first runs a new selection of them (RuSelection) —
 // takes what is there as the base; only fresh releases are news then,
 // dated by their premiere.
-const string RuSelection = "ru:v2"; // v2: up to 30 Russian series a year
+const string RuSelection = "ru:v3"; // v3: 30+ Russian series a year
 var ruBootstrap = ruTops.Count > 0 && !added.ContainsKey(RuSelection);
 foreach (var (kind, titles) in ruTops)
 {
