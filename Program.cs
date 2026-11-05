@@ -57,6 +57,12 @@ const int RuMinVotesCurrent = 100;  // the current year is still gathering votes
 // joins its year's top on top of the quota — a few series a month.
 const int RuFreshMinVotes = 1000;
 const double RuFreshMinRating = 7.0;
+// Russian series: the year's ten as above, then the new releases, then
+// every notable one (rated 7+ by 10 000+ people, most voted first) up to
+// thirty a year.
+const int RuSeriesYearMax = 30;
+const int RuNotableMinVotes = 10000;
+const double RuNotableMinRating = 7.0;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
 
@@ -904,8 +910,24 @@ if (File.Exists(kpKeyPath) && !smoke)
                                 System.Globalization.DateTimeStyles.None, out var released) &&
                             released <= today && released >= today.AddDays(-FreshDays))
                 .ToList();
+            var chosen = votesPart.Concat(ratingPart).ToList();
+            if (kind == "series")
+            {
+                var cap = RuSeriesYearMax;
+                freshPart = freshPart.OrderByDescending(t => t.Rating).Take(Math.Max(0, cap - chosen.Count)).ToList();
+                chosen.AddRange(freshPart);
+                chosen.AddRange(yearGroup.Except(chosen)
+                    .Where(t => Math.Round(t.Rating, 1) >= RuNotableMinRating && t.Votes >= RuNotableMinVotes &&
+                                !string.IsNullOrWhiteSpace(t.Description) && t.Poster != null)
+                    .OrderByDescending(t => t.Votes)
+                    .Take(Math.Max(0, cap - chosen.Count)));
+            }
+            else
+            {
+                chosen.AddRange(freshPart);
+            }
             ruFreshCount += freshPart.Count;
-            ruSelected.AddRange(votesPart.Concat(ratingPart).Concat(freshPart)
+            ruSelected.AddRange(chosen
                 .OrderBy(t => t.ReleaseDate ?? "9999-99-99")
                 .ThenByDescending(t => t.Votes));
         }
@@ -966,9 +988,11 @@ foreach (var kind in new[] { "movie", "series" })
     }
 }
 // The Russian tops (keyed like the app: IMDb id or "kp<id>"). The run that
-// first adds them takes what is there as the base; only fresh releases are
-// news then, dated by their premiere.
-var ruBootstrap = ruTops.Count > 0 && !added.ContainsKey("ru:since");
+// first adds them — or first runs a new selection of them (RuSelection) —
+// takes what is there as the base; only fresh releases are news then,
+// dated by their premiere.
+const string RuSelection = "ru:v2"; // v2: up to 30 Russian series a year
+var ruBootstrap = ruTops.Count > 0 && !added.ContainsKey(RuSelection);
 foreach (var (kind, titles) in ruTops)
 {
     foreach (var t in titles)
@@ -987,7 +1011,7 @@ foreach (var (kind, titles) in ruTops)
 }
 if (ruBootstrap)
 {
-    added["ru:since"] = "base";
+    added[RuSelection] = "base";
 }
 var newToday = 0;
 foreach (var (key, _, _, _) in currentKeys.DistinctBy(k => k.Key))
