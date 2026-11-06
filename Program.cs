@@ -1073,7 +1073,7 @@ foreach (var kind in new[] { "movie", "series" })
 // first adds them — or first runs a new selection of them (RuSelection) —
 // takes what is there as the base; only fresh releases are news then,
 // dated by their premiere.
-const string RuSelection = "ru:v5"; // v3: 30+ Russian series a year; v4: Soviet titles; v5: series 10 000+ votes
+const string RuSelection = "ru:v6"; // v3: 30+ Russian series a year; v4: Soviet titles; v5: series 10 000+ votes; v6: digital premieres
 var ruBootstrap = ruTops.Count > 0 && !added.ContainsKey(RuSelection);
 foreach (var (kind, titles) in ruTops)
 {
@@ -1689,7 +1689,8 @@ internal sealed record KpTitle(int Id, int Year, string TitleRu, string? TitleEn
         }
 
         var premiere = Obj(m, "premiere");
-        var date = Str(premiere, "russia") ?? Str(premiere, "world");
+        // Series of the streaming services often have only the digital premiere.
+        var date = Str(premiere, "russia") ?? Str(premiere, "world") ?? Str(premiere, "digital");
         var imdb = Str(Obj(m, "externalId"), "imdb");
         var description = Str(m, "description");
         if (string.IsNullOrWhiteSpace(description))
