@@ -60,11 +60,11 @@ const double RuFreshMinRating = 7.0;
 // Russian series: the year's ten as above, then the new releases, then
 // the notable ones (rated 7+ by 10 000+ people, most voted first) and the
 // rest by votes up to thirty a year at least. A series rated above 7 by
-// more than 50 000 people is always in, past the thirty.
+// more than 10 000 people is always in, past the thirty.
 const int RuSeriesYearMin = 30;
 const int RuNotableMinVotes = 10000;
 const double RuNotableMinRating = 7.0;
-const int RuMustMinVotes = 50000;
+const int RuMustMinVotes = 10000;
 const double RuMustMinRating = 7.0;
 
 var smoke = args.Contains("--smoke"); // small run to validate the pipeline fast
@@ -1073,7 +1073,7 @@ foreach (var kind in new[] { "movie", "series" })
 // first adds them — or first runs a new selection of them (RuSelection) —
 // takes what is there as the base; only fresh releases are news then,
 // dated by their premiere.
-const string RuSelection = "ru:v4"; // v3: 30+ Russian series a year
+const string RuSelection = "ru:v5"; // v3: 30+ Russian series a year; v4: Soviet titles; v5: series 10 000+ votes
 var ruBootstrap = ruTops.Count > 0 && !added.ContainsKey(RuSelection);
 foreach (var (kind, titles) in ruTops)
 {
