@@ -699,6 +699,55 @@ await Task.WhenAll(personWork.Select(async id =>
 SavePersons();
 Console.WriteLine($"\r  люди {personDone}/{personWork.Count} готово   ");
 
+// TMDB has a Russian name for fewer than half of them ("Fritz Lang");
+// Wikidata, found by the TMDB person id, has most of the rest ("Фриц Ланг").
+// Kept in cache/wikidata-names.json; those it did not know ("") are asked
+// again each run. The people of the recommendations (people.json) too.
+static bool Cyrillic(string? text) => text != null && text.Any(c => c is >= 'А' and <= 'я' or 'Ё' or 'ё');
+var wikiNamesPath = Path.Combine(cacheDir, "wikidata-names.json");
+var wikiNames = File.Exists(wikiNamesPath)
+    ? JsonSerializer.Deserialize<Dictionary<int, string>>(File.ReadAllText(wikiNamesPath)) ?? new()
+    : new Dictionary<int, string>();
+var wikiWork = personIds.Union(peopleNames.Keys.Select(int.Parse))
+    .Where(id => !Cyrillic(persons.GetValueOrDefault(id)?.NameRu) && string.IsNullOrEmpty(wikiNames.GetValueOrDefault(id)))
+    .ToList();
+var wikiFound = 0;
+foreach (var chunk in wikiWork.Chunk(300))
+{
+    try
+    {
+        var query = "SELECT ?tmdb ?label WHERE { VALUES ?tmdb {" + string.Join(" ", chunk.Select(id => $"\"{id}\"")) +
+                    "} ?p wdt:P4985 ?tmdb. ?p rdfs:label ?label FILTER(lang(?label)=\"ru\") }";
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://query.wikidata.org/sparql")
+        {
+            Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["query"] = query })
+        };
+        request.Headers.Accept.ParseAdd("application/sparql-results+json");
+        using var response = await http.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        foreach (var id in chunk)
+        {
+            wikiNames[id] = string.Empty;
+        }
+        foreach (var row in doc.RootElement.GetProperty("results").GetProperty("bindings").EnumerateArray())
+        {
+            if (int.TryParse(row.GetProperty("tmdb").GetProperty("value").GetString(), out var id) &&
+                row.GetProperty("label").GetProperty("value").GetString() is { } label && Cyrillic(label))
+            {
+                wikiNames[id] = label;
+                wikiFound++;
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  ! wikidata: {ex.Message}");
+    }
+}
+File.WriteAllText(wikiNamesPath, JsonSerializer.Serialize(wikiNames));
+Console.WriteLine($"  русские имена из Wikidata: {wikiFound:N0} из {wikiWork.Count:N0} запрошенных");
+
 // Works: "Тёмный рыцарь|The Dark Knight" (the original title only when it
 // differs); names: "Кристофер Нолан|Christopher Nolan" (the same way).
 var creatorWorks = new List<string>();
@@ -737,6 +786,10 @@ foreach (var row in creatorRows)
     {
         var first = group.First();
         var nameRu = persons.GetValueOrDefault(first.Id)?.NameRu;
+        if (!Cyrillic(nameRu) && !string.IsNullOrEmpty(wikiNames.GetValueOrDefault(first.Id)))
+        {
+            nameRu = wikiNames[first.Id];
+        }
         creatorNames[first.Id.ToString()] = Pair(string.IsNullOrWhiteSpace(nameRu) ? first.NameEn : nameRu, first.NameEn);
         var credit = $"{string.Concat(group.Select(c => c.Role))}:{first.Id}";
         if (group.Select(c => c.Work).FirstOrDefault(w => w != null) is { } bestWork)
@@ -827,9 +880,24 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
 }
 
 // Who made what: "d:123" (director), "w:…" (writer), "c:…" (creator).
+// namesRu: the Russian names known (the app falls back to names).
+var peopleNamesRu = new Dictionary<string, string>();
+foreach (var key in peopleNames.Keys)
+{
+    var id = int.Parse(key);
+    var nameRu = persons.GetValueOrDefault(id)?.NameRu;
+    if (!Cyrillic(nameRu))
+    {
+        nameRu = wikiNames.GetValueOrDefault(id);
+    }
+    if (Cyrillic(nameRu))
+    {
+        peopleNamesRu[key] = nameRu!;
+    }
+}
 File.WriteAllText(Path.Combine(docsDir, "data", "people.json"),
-    JsonSerializer.Serialize(new { names = peopleNames, links = peopleLinks }, jsonOpts));
-Console.WriteLine($"  people.json: {peopleLinks.Count} титлов");
+    JsonSerializer.Serialize(new { names = peopleNames, namesRu = peopleNamesRu, links = peopleLinks }, jsonOpts));
+Console.WriteLine($"  people.json: {peopleLinks.Count} титлов, русских имён {peopleNamesRu.Count} из {peopleNames.Count}");
 
 // Every movie in cinemas, for the app's own lists (not only the tops).
 File.WriteAllText(Path.Combine(docsDir, "data", "cinema.json"), JsonSerializer.Serialize(
@@ -876,6 +944,13 @@ if (File.Exists(kpKeyPath) && !smoke)
                 // Until April last year's titles are still gathering votes too.
                 var fromYear = today.Month <= 3 ? currentYear - 1 : currentYear;
                 await FetchKpRangeAsync(kpKey, types, fromYear, currentYear, RuMinVotesCurrent, fresh);
+            }
+            // Soviet titles too, once: their years are over.
+            var ussrMark = Path.Combine(kpDir, $"{kind}.ussr.full");
+            if (!File.Exists(ussrMark))
+            {
+                await FetchKpRangeAsync(kpKey, types, 1900, 1992, RuMinVotes, fresh, "СССР");
+                File.WriteAllText(ussrMark, DateTime.UtcNow.ToString("o"));
             }
         }
         catch (Exception ex)
@@ -998,7 +1073,7 @@ foreach (var kind in new[] { "movie", "series" })
 // first adds them — or first runs a new selection of them (RuSelection) —
 // takes what is there as the base; only fresh releases are news then,
 // dated by their premiere.
-const string RuSelection = "ru:v3"; // v3: 30+ Russian series a year
+const string RuSelection = "ru:v4"; // v3: 30+ Russian series a year
 var ruBootstrap = ruTops.Count > 0 && !added.ContainsKey(RuSelection);
 foreach (var (kind, titles) in ruTops)
 {
@@ -1036,27 +1111,26 @@ var news = currentKeys
 File.WriteAllText(Path.Combine(docsDir, "data", "news.json"), JsonSerializer.Serialize(news, jsonOpts));
 Console.WriteLine($"  news.json: {news.Count} записей ({newToday} новых сегодня)");
 
-// Russian titles of these years: the free tier serves only 10 pages of a
+// Russian (or Soviet) titles of these years: the free tier serves only 10 pages of a
 // query, so a range that has more is split in two. Whatever arrived before a
 // failure is kept (the caller saves it).
-async Task FetchKpRangeAsync(string key, string[] types, int from, int to, int minVotes, List<KpTitle> into)
+async Task FetchKpRangeAsync(string key, string[] types, int from, int to, int minVotes, List<KpTitle> into, string country = "Россия")
 {
     const int MaxPages = 10;
-    var pages = await FetchKpAsync(key, types, from, to, minVotes, into, MaxPages);
+    var pages = await FetchKpAsync(key, types, from, to, minVotes, into, MaxPages, country);
     if (pages > MaxPages && from < to)
     {
         var middle = (from + to) / 2;
         // The halves fetch their titles anew; duplicates collapse by id.
-        await FetchKpRangeAsync(key, types, from, middle, minVotes, into);
-        await FetchKpRangeAsync(key, types, middle + 1, to, minVotes, into);
+        await FetchKpRangeAsync(key, types, from, middle, minVotes, into, country);
+        await FetchKpRangeAsync(key, types, middle + 1, to, minVotes, into, country);
     }
 }
 
 // One query, up to maxPages pages; returns how many pages it has in all.
-async Task<int> FetchKpAsync(string key, string[] types, int from, int to, int minVotes, List<KpTitle> result, int maxPages)
+async Task<int> FetchKpAsync(string key, string[] types, int from, int to, int minVotes, List<KpTitle> result, int maxPages, string country)
 {
-    var russia = Uri.EscapeDataString("Россия");
-    var query = $"limit=250&countries.name={russia}&votes.kp={minVotes}-999999999&sortField=votes.kp&sortType=-1" +
+    var query = $"limit=250&countries.name={Uri.EscapeDataString(country)}&votes.kp={minVotes}-999999999&sortField=votes.kp&sortType=-1" +
                 string.Concat(types.Select(t => $"&type={t}")) +
                 (from == to ? $"&year={from}" : $"&year={from}-{to}") +
                 string.Concat(new[] { "id", "name", "alternativeName", "enName", "year", "rating", "votes", "externalId",
@@ -1081,10 +1155,10 @@ async Task<int> FetchKpAsync(string key, string[] types, int from, int to, int m
         if (pages > maxPages && from < to)
         {
             // Too big for the free tier: the caller splits the range.
-            Console.WriteLine($"  КП {string.Join('/', types)} {from}-{to}: {pages} стр., делю");
+            Console.WriteLine($"  КП {country} {string.Join('/', types)} {from}-{to}: {pages} стр., делю");
             return pages;
         }
-        Console.WriteLine($"  КП {string.Join('/', types)} {from}-{to}: стр. {page}/{pages}");
+        Console.WriteLine($"  КП {country} {string.Join('/', types)} {from}-{to}: стр. {page}/{pages}");
         if (page >= Math.Min(pages, maxPages))
         {
             return pages;
