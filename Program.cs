@@ -826,6 +826,8 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
             ["releaseDate"] = tmdb?.ReleaseDate,
             ["rating"] = row.Rating,
             ["votes"] = row.Votes,
+            // IMDb's genres ("Action,Drama"): the app's card game draws on them.
+            ["genres"] = row.Genres.Length > 0 ? string.Join(",", row.Genres) : null,
             ["titleOriginal"] = row.OriginalTitle,
             ["titleEn"] = tmdb?.TitleEn ?? row.Title,
             ["titleRu"] = tmdb?.TitleRu,
@@ -855,6 +857,7 @@ foreach (var (kind, fileName) in new[] { ("movie", "movies.json"), ("series", "s
         ["releaseDate"] = m["releaseDate"],
         ["rating"] = m["rating"],
         ["votes"] = m["votes"],
+        ["genres"] = m["genres"],
         ["titleOriginal"] = m["titleOriginal"],
         ["titleEn"] = m["titleEn"],
         ["titleRu"] = m["titleRu"],
